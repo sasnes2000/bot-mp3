@@ -86,11 +86,9 @@ async function getDecipherFn(env) {
       || js.match(/(\w+)\s*=\s*function\(\s*\w+\s*\)\s*\{\s*\w+\.reverse\(\)/)?.[1];
     if (!fnName) return null;
 
-    // Извлечь тело функции и зависимости
     const fnBody = js.match(new RegExp(`function\\s+${fnName}\\s*\\(\\s*\\w+\\s*\\)\\s*\\{([^}]+(?:\\{[^}]*\\}[^}]*)*)\\}`));
     const fnBody2 = js.match(new RegExp(`var\\s+${fnName}\\s*=\\s*function\\s*\\(\\s*\\w+\\s*\\)\\s*\\{([\\s\\S]*?)\\}\\s*;`));
 
-    // Найти helper-объект
     const helperName = js.match(new RegExp(`function\\s+${fnName}\\s*\\([\\s\\S]*?\\)\\s*\\{[\\s\\S]*?\\b(\\w+)\\.\\w+`))?.[1]
       || js.match(new RegExp(`var\\s+${fnName}\\s*=[\\s\\S]*?\\b(\\w+)\\.\\w+`))?.[1];
 
@@ -100,7 +98,6 @@ async function getDecipherFn(env) {
       if (hMatch) helperBody = `var ${helperName}={${hMatch[1]}};`;
     }
 
-    // Собрать функцию
     const body = (fnBody?.[1] || fnBody2?.[1] || '').trim();
     const code = `
       ${helperBody}
@@ -161,7 +158,7 @@ async function fromYouTubeRaw(env, vidId, errors) {
 
       if (!audio) { errors.push(`${c.name}: нет прямой ссылки`); continue; }
 
-      const file = await download(audio.url);
+      const file = await download(audio.url, c.ua);
       if (file) {
         const m4a = /mp4/.test(audio.mimeType || '');
         const title = data?.videoDetails?.title || 'audio';
@@ -213,7 +210,7 @@ async function fromYouTubeWeb(env, vidId, errors) {
       }
       if (!url) { errors.push(`${c.name}: нет URL`); continue; }
 
-      const file = await download(url);
+      const file = await download(url, c.ua);
       if (file) {
         const m4a = /mp4/.test(audio.mimeType || '');
         const title = data?.videoDetails?.title || 'audio';
@@ -244,7 +241,7 @@ async function fromCobalt(env, ytUrl, errors) {
     const data = await res.json().catch(() => ({}));
     const link = data.url || data.picker?.[0]?.url;
     if (!link) { errors.push(`cobalt: ${data.error?.code || data.text || res.status}`); return null; }
-    const file = await download(link);
+    const file = await download(link, 'Mozilla/5.0');
     if (!file) { errors.push('cobalt: файл пустой'); return null; }
     return { ...file, filename: data.filename || 'audio.mp3', mime: 'audio/mpeg' };
   } catch (err) {
@@ -255,10 +252,22 @@ async function fromCobalt(env, ytUrl, errors) {
 
 // ── Общее ────────────────────────────────────────────────────────────────────
 
-async function download(url, minBytes = 50000) {
-  const res = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } });
+async function download(url, ua = 'Mozilla/5.0', minBytes = 10000) {
+  const res = await fetch(url, {
+    redirect: 'follow',
+    headers: {
+      'User-Agent': ua,
+      'Range': 'bytes=0-',
+      'Accept': '*/*',
+      'Accept-Encoding': 'identity',
+    },
+  });
   const buf = await res.arrayBuffer();
-  return buf.byteLength >= minBytes ? { buf } : null;
+  if (buf.byteLength < minBytes) return null;
+  // Проверяем что это не HTML-страница с ошибкой
+  const preview = new TextDecoder().decode(new Uint8Array(buf).slice(0, 200));
+  if (/<!DOCTYPE|<html|<head/i.test(preview)) return null;
+  return { buf };
 }
 
 async function getAudio(env, ytUrl) {
