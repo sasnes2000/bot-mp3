@@ -1,17 +1,23 @@
-// Telegram-бот: YouTube-ссылка → MP3
-// 1. InnerTube (YouTube напрямую) — основной метод
-// 2. Свой cobalt (COBALT_API) — fallback, если задан
+// Telegram-бот: YouTube-ссылка → аудиофайл.
+// InnerTube + signatureCipher deciphering + cobalt fallback.
 
 const URL_RE =
-  /(https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/|live\/)|youtu\.be\/)[\w-]+)/i;
+  /(https?:\/\/(?:www\.|m.)?(?:youtube\.com\/(?:watch\?v=|shorts\/|live\/)|youtu\.be\/)[\w-]+)/i;
 
 const INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
 
-const CLIENTS = [
+// Клиенты БЕЗ cookie — они возвращают прямые ссылки
+const RAW_CLIENTS = [
   { name: 'ANDROID', ver: '20.10.38', sdk: 30, ua: 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip' },
-  { name: 'ANDROID_VR', ver: '1.62.27', sdk: 32, ua: 'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12; GB) gzip' },
+  { name: 'ANDROID_MUSIC', ver: '7.27.52', sdk: 30, ua: 'com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip' },
+  { name: 'TVHTML5', ver: '7.20241201.14.00', screen: 'EMBED', ua: 'Mozilla/5.0 (PlayStation; PlayStation 4/5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15' },
   { name: 'IOS', ver: '20.10.4', sdk: null, ua: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 17_4 like Mac OS X)' },
-  { name: 'WEB_EMBEDDED_PLAYER', ver: '1.20250101.00.00', sdk: null, screen: 'EMBED', ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0' },
+];
+
+// Клиенты С cookie (WEB) — нужен deciphering
+const WEB_CLIENTS = [
+  { name: 'WEB', ver: '2.20250101.00.00', ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0' },
+  { name: 'WEB_EMBEDDED_PLAYER', ver: '1.20250101.00.00', screen: 'EMBED', ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0' },
 ];
 
 const tg = (env, method, payload) =>
@@ -28,51 +34,128 @@ const edit = (env, chatId, messageId, text) =>
   }).catch(() => {});
 
 const videoId = (url) => (url.match(/(?:v=|youtu\.be\/|shorts\/|live\/)([\w-]{11})/) || [])[1] || null;
-const short = (err) => String(err?.message || err).slice(0, 60);
+const short = (err) => String(err?.message || err).slice(0, 80);
 
-// ── InnerTube (прямой запрос к YouTube) ──────────────────────────────
+// ── Cookie auth для WEB клиентов ────────────────────────────────────────────
 
-async function fromYouTube(env, vidId, errors) {
-  for (const c of CLIENTS) {
+async function authHeaders(env, base) {
+  if (!env.YT_COOKIE) return base;
+  const cookie = env.YT_COOKIE;
+  const headers = { ...base, Cookie: cookie };
+  const val = (k) => cookie.match(new RegExp(`(?:^|; )${k}=([^;]+)`))?.[1];
+  const origin = 'https://www.youtube.com';
+  const ts = Math.floor(Date.now() / 1000);
+  const sha1 = async (s) => {
+    const d = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(s));
+    return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  };
+  const parts = [];
+  for (const [name, label] of [
+    ['SAPISID', 'SAPISIDHASH'],
+    ['__Secure-1PAPISID', 'SAPISID1PHASH'],
+    ['__Secure-3PAPISID', 'SAPISID3PHASH'],
+  ]) {
+    const v = val(name);
+    if (v) parts.push(`${label} ${ts}_${await sha1(`${ts} ${v} ${origin}`)}`);
+  }
+  if (parts.length) headers.Authorization = parts.join(' ');
+  if (val('__Secure-3PAPISID') || val('SAPISID')) headers['X-Origin'] = origin;
+  return headers;
+}
+
+// ── Signature deciphering для WEB клиентов ──────────────────────────────────
+
+let _decipherCache = null;
+
+async function getDecipherFn(env) {
+  if (_decipherCache) return _decipherCache;
+  if (!env.YT_COOKIE) return null;
+  try {
+    const pageRes = await fetch('https://www.youtube.com/', {
+      headers: { 'User-Agent': 'Mozilla/5.0', Cookie: env.YT_COOKIE },
+    });
+    const html = await pageRes.text();
+    const playerUrlMatch = html.match(/"(https?:\/\/www\.youtube\.com\/s\/player\/[^"]+\/player_ias\.vflset\/en_US\/base\.js)"/);
+    if (!playerUrlMatch) return null;
+    const jsRes = await fetch(playerUrlMatch[1]);
+    const js = await jsRes.text();
+
+    // Найти функцию decipher
+    const fnName = js.match(/b=a\.get\("signature"\)\)a=a\.split\(""\);(.*?)\(/)?.[1]
+      || js.match(/var \w+=\w+\.split\(""\),(\w+)=\[/)?.[1]
+      || js.match(/(\w+)\s*=\s*function\(\s*\w+\s*\)\s*\{\s*\w+\.reverse\(\)/)?.[1];
+    if (!fnName) return null;
+
+    // Извлечь тело функции и зависимости
+    const fnBody = js.match(new RegExp(`function\\s+${fnName}\\s*\\(\\s*\\w+\\s*\\)\\s*\\{([^}]+(?:\\{[^}]*\\}[^}]*)*)\\}`));
+    const fnBody2 = js.match(new RegExp(`var\\s+${fnName}\\s*=\\s*function\\s*\\(\\s*\\w+\\s*\\)\\s*\\{([\\s\\S]*?)\\}\\s*;`));
+
+    // Найти helper-объект
+    const helperName = js.match(new RegExp(`function\\s+${fnName}\\s*\\([\\s\\S]*?\\)\\s*\\{[\\s\\S]*?\\b(\\w+)\\.\\w+`))?.[1]
+      || js.match(new RegExp(`var\\s+${fnName}\\s*=[\\s\\S]*?\\b(\\w+)\\.\\w+`))?.[1];
+
+    let helperBody = '';
+    if (helperName) {
+      const hMatch = js.match(new RegExp(`var\\s+${helperName}\\s*=\\s*\\{([\\s\\S]*?)\\}\\s*;`));
+      if (hMatch) helperBody = `var ${helperName}={${hMatch[1]}};`;
+    }
+
+    // Собрать функцию
+    const body = (fnBody?.[1] || fnBody2?.[1] || '').trim();
+    const code = `
+      ${helperBody}
+      var ${fnName} = function(a) {
+        a = a.split("");
+        ${body}
+        return a.join("");
+      };
+      return ${fnName};
+    `;
+    _decipherCache = new Function(code)();
+    return _decipherCache;
+  } catch {
+    return null;
+  }
+}
+
+function decodeSig(signatureCipher, decipherFn) {
+  if (!signatureCipher || !decipherFn) return null;
+  const params = new URLSearchParams(signatureCipher);
+  const s = params.get('s');
+  const sp = params.get('sp') || 'sig';
+  const base = params.get('url');
+  if (!s || !base) return null;
+  try {
+    const sig = decipherFn(s);
+    return `${base}&${sp}=${encodeURIComponent(sig)}`;
+  } catch {
+    return null;
+  }
+}
+
+// ── 1. InnerTube (прямые клиенты — без cookie, без deciphering) ──────────────
+
+async function fromYouTubeRaw(env, vidId, errors) {
+  for (const c of RAW_CLIENTS) {
     const client = { clientName: c.name, clientVersion: c.ver, hl: 'en', gl: 'US' };
     if (c.sdk) client.androidSdkVersion = c.sdk;
     if (c.screen) client.clientScreen = c.screen;
 
     try {
-      const headers = { 'Content-Type': 'application/json', 'User-Agent': c.ua };
-      if (env.YT_COOKIE) {
-        headers.Cookie = env.YT_COOKIE;
-        // SAPISID auth если есть куки
-        const val = (k) => env.YT_COOKIE.match(new RegExp(`(?:^|; )${k}=([^;]+)`))?.[1];
-        const origin = 'https://www.youtube.com';
-        const ts = Math.floor(Date.now() / 1000);
-        const sha1 = async (s) => {
-          const d = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(s));
-          return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
-        };
-        const parts = [];
-        for (const [name, label] of [
-          ['SAPISID', 'SAPISIDHASH'],
-          ['__Secure-1PAPISID', 'SAPISID1PHASH'],
-          ['__Secure-3PAPISID', 'SAPISID3PHASH'],
-        ]) {
-          const v = val(name);
-          if (v) parts.push(`${label} ${ts}_${await sha1(`${ts} ${v} ${origin}`)}`);
-        }
-        if (parts.length) headers.Authorization = parts.join(' ');
-        if (val('__Secure-3PAPISID') || val('SAPISID')) headers['X-Origin'] = origin;
-      }
-
       const res = await fetch(
         `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}&prettyPrint=false`,
-        { method: 'POST', headers, body: JSON.stringify({ context: { client }, videoId: vidId, contentCheckOk: true, racyCheckOk: true }) }
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'User-Agent': c.ua },
+          body: JSON.stringify({ context: { client }, videoId: vidId, contentCheckOk: true, racyCheckOk: true }),
+        }
       );
       const data = await res.json().catch(() => ({}));
       const status = data?.playabilityStatus?.status;
-
       if (status && status !== 'OK') { errors.push(`${c.name}: ${status}`); continue; }
 
-      const audio = (data?.streamingData?.adaptiveFormats || [])
+      const formats = [...(data?.streamingData?.adaptiveFormats || []), ...(data?.streamingData?.formats || [])];
+      const audio = formats
         .filter((f) => (f.mimeType || '').startsWith('audio') && f.url)
         .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
 
@@ -85,12 +168,66 @@ async function fromYouTube(env, vidId, errors) {
         return { ...file, filename: `${title}.${m4a ? 'm4a' : 'webm'}`, mime: m4a ? 'audio/mp4' : 'audio/webm' };
       }
       errors.push(`${c.name}: файл пустой`);
-    } catch (err) { errors.push(`${c.name}: ${short(err)}`); }
+    } catch (err) {
+      errors.push(`${c.name}: ${short(err)}`);
+    }
   }
   return null;
 }
 
-// ── Свой cobalt (если задан COBALT_API) ──────────────────────────────
+// ── 2. InnerTube (WEB клиенты с cookie + deciphering) ───────────────────────
+
+async function fromYouTubeWeb(env, vidId, errors) {
+  if (!env.YT_COOKIE) return null;
+  const decipherFn = await getDecipherFn(env);
+
+  for (const c of WEB_CLIENTS) {
+    const client = { clientName: c.name, clientVersion: c.ver, hl: 'en', gl: 'US' };
+    if (c.screen) client.clientScreen = c.screen;
+
+    try {
+      const res = await fetch(
+        `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}&prettyPrint=false`,
+        {
+          method: 'POST',
+          headers: await authHeaders(env, { 'Content-Type': 'application/json', 'User-Agent': c.ua }),
+          body: JSON.stringify({ context: { client }, videoId: vidId, contentCheckOk: true, racyCheckOk: true }),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      const status = data?.playabilityStatus?.status;
+      if (status && status !== 'OK') { errors.push(`${c.name}: ${status}`); continue; }
+
+      const formats = [...(data?.streamingData?.adaptiveFormats || []), ...(data?.streamingData?.formats || [])];
+      const audio = formats
+        .filter((f) => (f.mimeType || '').startsWith('audio') && (f.url || f.signatureCipher))
+        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+      if (!audio) { errors.push(`${c.name}: нет форматов`); continue; }
+
+      let url = audio.url;
+      if (!url && audio.signatureCipher) {
+        if (!decipherFn) { errors.push(`${c.name}: нужен deciphering, но не удалось`); continue; }
+        url = decodeSig(audio.signatureCipher, decipherFn);
+        if (!url) { errors.push(`${c.name}: ошибка deciphering`); continue; }
+      }
+      if (!url) { errors.push(`${c.name}: нет URL`); continue; }
+
+      const file = await download(url);
+      if (file) {
+        const m4a = /mp4/.test(audio.mimeType || '');
+        const title = data?.videoDetails?.title || 'audio';
+        return { ...file, filename: `${title}.${m4a ? 'm4a' : 'webm'}`, mime: m4a ? 'audio/mp4' : 'audio/webm' };
+      }
+      errors.push(`${c.name}: файл пустой`);
+    } catch (err) {
+      errors.push(`${c.name}: ${short(err)}`);
+    }
+  }
+  return null;
+}
+
+// ── 3. Свой cobalt (если задан COBALT_API) ───────────────────────────────────
 
 async function fromCobalt(env, ytUrl, errors) {
   const api = (env.COBALT_API || '').trim();
@@ -110,10 +247,13 @@ async function fromCobalt(env, ytUrl, errors) {
     const file = await download(link);
     if (!file) { errors.push('cobalt: файл пустой'); return null; }
     return { ...file, filename: data.filename || 'audio.mp3', mime: 'audio/mpeg' };
-  } catch (err) { errors.push(`cobalt: ${short(err)}`); return null; }
+  } catch (err) {
+    errors.push(`cobalt: ${short(err)}`);
+    return null;
+  }
 }
 
-// ── Общее ────────────────────────────────────────────────────────────
+// ── Общее ────────────────────────────────────────────────────────────────────
 
 async function download(url, minBytes = 50000) {
   const res = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } });
@@ -126,7 +266,8 @@ async function getAudio(env, ytUrl) {
   const vid = videoId(ytUrl);
 
   const result =
-    (vid && (await fromYouTube(env, vid, errors))) ||
+    (vid && (await fromYouTubeRaw(env, vid, errors))) ||
+    (vid && (await fromYouTubeWeb(env, vid, errors))) ||
     (await fromCobalt(env, ytUrl, errors));
 
   if (result) return result;
@@ -140,9 +281,10 @@ async function sendAudio(env, chatId, buf, title, mime) {
   form.append('performer', 'YouTube');
   form.append('audio', new Blob([buf], { type: mime }), `${title}.m4a`);
 
-  return fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendAudio`, {
+  const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendAudio`, {
     method: 'POST', body: form,
-  }).then(r => r.json());
+  });
+  return res.json();
 }
 
 async function handleUpdate(update, env) {
