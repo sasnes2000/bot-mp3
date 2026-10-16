@@ -82,9 +82,13 @@ async function tryCobalt(env, ytUrl, errs) {
 const INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
 
 const CLIENTS = [
-  { name: 'ANDROID', ver: '19.09.37', sdk: 30, ua: 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip' },
-  { name: 'ANDROID_VR', ver: '1.60.19', sdk: 32, ua: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; GB) gzip' },
-  { name: 'IOS', ver: '19.09.3', sdk: null, ua: 'com.google.ios.youtube/19.09.3 (iPhone16,2; U; CPU iOS 17_4 like Mac OS X)' },
+  { name: 'ANDROID', ver: '20.10.38', sdk: 30, ua: 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip' },
+  { name: 'ANDROID_VR', ver: '1.62.27', sdk: 32, ua: 'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12; GB) gzip' },
+  { name: 'IOS', ver: '20.10.4', sdk: null, ua: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 17_4 like Mac OS X)' },
+  { name: 'MWEB', ver: '2.20250101.01.00', sdk: null, ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X)' },
+  { name: 'WEB', ver: '2.20250101.01.00', sdk: null, ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36' },
+  { name: 'WEB_EMBEDDED_PLAYER', ver: '1.20250101.00.00', sdk: null, screen: 'EMBED', ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36' },
+  { name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', ver: '2.0', sdk: null, screen: 'EMBED', ua: 'Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15' },
 ];
 
 async function tryInnerTube(env, vidId, errs) {
@@ -92,6 +96,7 @@ async function tryInnerTube(env, vidId, errs) {
     try {
       const client = { clientName: c.name, clientVersion: c.ver, hl: 'en', gl: 'US' };
       if (c.sdk) client.androidSdkVersion = c.sdk;
+      if (c.screen) client.clientScreen = c.screen;
       const res = await fetch(
         `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}&prettyPrint=false`,
         {
@@ -106,20 +111,21 @@ async function tryInnerTube(env, vidId, errs) {
         }
       );
       const data = await res.json().catch(() => ({}));
-      const playability = data?.playabilityStatus?.status;
-      if (playability && playability !== 'OK') {
-        errs.push(`innertube/${c.name} → ${playability}`);
+      const ps = data?.playabilityStatus || {};
+      if (ps.status && ps.status !== 'OK') {
+        errs.push(`innertube/${c.name} → ${ps.status}: ${(ps.reason || '').slice(0, 60)}`);
         continue;
       }
       const formats = (data?.streamingData?.adaptiveFormats || []).filter(
-        (f) => (f.mimeType || '').startsWith('audio') && f.url
+        (f) => (f.mimeType || '').startsWith('audio') && (f.url || f.signatureCipher || f.cipher)
       );
-      formats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-      if (!formats.length) {
-        errs.push(`innertube/${c.name} → нет прямых аудио-ссылок`);
+      const direct = formats.filter((f) => f.url);
+      direct.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      if (!direct.length) {
+        errs.push(`innertube/${c.name} → нет URL (форм ${formats.length}${formats.length ? ', нужна расшифровка sig' : ''})`);
         continue;
       }
-      const f = formats[0];
+      const f = direct[0];
       const g = await grab(f.url, 50000);
       if (g.ok) {
         const mime = /mp4/.test(f.mimeType) ? 'audio/mp4' : 'audio/webm';
