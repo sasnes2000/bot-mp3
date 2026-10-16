@@ -16,51 +16,64 @@ const edit = (env, chatId, messageId, text) =>
     disable_web_page_preview: true,
   }).catch(() => {});
 
-async function resolveAudio(env, ytUrl) {
-  const api = env.COBALT_API || 'https://api.cobalt.tools/';
-  const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
-  if (env.COBALT_KEY) headers.Authorization = `Api-Key ${env.COBALT_KEY}`;
+const DEFAULT_INSTANCES = [
+  'https://co.wuk.sh/',
+  'https://cobalt-api.kwiatekmiki.com/',
+  'https://api.cobalt.best/',
+  'https://cobalt.255x.ru/',
+  'https://api.cobalt.tools/',
+];
 
-  const res = await fetch(api, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      url: ytUrl,
-      downloadMode: 'audio',
-      audioFormat: 'mp3',
-      filenameStyle: 'basic',
-    }),
-  });
-
-  const data = await res.json().catch(() => ({}));
-  const link =
-    data.url ||
-    (data.picker && data.picker[0] && data.picker[0].url) ||
-    null;
-
-  if (!link) {
-    const e = data.error;
-    const reason =
-      (e && (typeof e === 'string' ? e : e.code || e.text || JSON.stringify(e))) ||
-      data.text ||
-      `конвертер вернул ${res.status}`;
-    throw new Error(reason);
-  }
-  return { link, filename: data.filename || 'audio.mp3', status: data.status };
+function instances(env) {
+  const raw = (env.COBALT_API || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const list = raw.length ? raw : DEFAULT_INSTANCES;
+  return list.map((u) => (u.endsWith('/') ? u : u + '/'));
 }
 
-async function sendAudioFromUrl(env, chatId, link, title) {
-  const res = await fetch(link, {
-    redirect: 'follow',
-    headers: { 'User-Agent': 'Mozilla/5.0', Accept: '*/*' },
-  });
-  const buf = await res.arrayBuffer();
-  if (!buf.byteLength) {
-    const hdrs = {};
-    res.headers.forEach((v, k) => (hdrs[k] = v));
-    throw new Error(`пустой файл: ${JSON.stringify(hdrs)}`);
-  }
+async function resolveAudio(env, ytUrl) {
+  const urls = instances(env);
+  let lastErr;
+  for (const api of urls) {
+    try {
+      const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
+      if (env.COBALT_KEY) headers.Authorization = `Api-Key ${env.COBALT_KEY}`;
 
+      const res = await fetch(api, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          url: ytUrl,
+          downloadMode: 'audio',
+          audioFormat: 'mp3',
+          filenameStyle: 'basic',
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (data.status === 'tunnel' || data.status === 'redirect') {
+        const link = data.url || (data.picker && data.picker[0] && data.picker[0].url);
+        if (link) {
+          const check = await fetch(link, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } });
+          const buf = await check.arrayBuffer();
+          if (buf.byteLength) return { buf, filename: data.filename || 'audio.mp3' };
+          lastErr = new Error(`${api} → пустой файл`);
+        } else {
+          lastErr = new Error(`${api} → нет ссылки`);
+        }
+      } else {
+        const e = data.error;
+        lastErr = new Error(
+          (e && (e.code || (typeof e === 'string' ? e : JSON.stringify(e)))) || data.text || `${api} → ${res.status}`
+        );
+      }
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('все инстансы не сработали');
+}
+
+async function sendAudio(env, chatId, buf, title) {
   const form = new FormData();
   form.append('chat_id', String(chatId));
   form.append('title', title);
@@ -96,17 +109,17 @@ async function handleUpdate(update, env) {
   const statusId = status?.result?.message_id;
 
   try {
-    const { link, filename } = await resolveAudio(env, match[1]);
+    const { buf, filename } = await resolveAudio(env, match[1]);
 
     if (statusId) await edit(env, chatId, statusId, '📤 Отправляю файл...');
 
-    const sent = await sendAudioFromUrl(env, chatId, link, filename.replace(/\.mp3$/i, ''));
+    const sent = await sendAudio(env, chatId, buf, filename.replace(/\.mp3$/i, ''));
 
     if (!sent.ok) {
       throw new Error(
         /too big/i.test(sent.description || '')
           ? 'файл больше 50 MB — лимит Telegram-бота'
-          : `${sent.description || 'Telegram не принял файл'}\n🔗 ${link}`
+          : sent.description || 'Telegram не принял файл'
       );
     }
 
