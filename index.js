@@ -49,6 +49,24 @@ async function resolveAudio(env, ytUrl) {
   return { link, filename: data.filename || 'audio.mp3' };
 }
 
+async function sendAudioFromUrl(env, chatId, link, title) {
+  const res = await fetch(link, { redirect: 'follow' });
+  if (!res.ok) throw new Error(`не скачал файл (${res.status})`);
+  const buf = await res.arrayBuffer();
+
+  const form = new FormData();
+  form.append('chat_id', String(chatId));
+  form.append('title', title);
+  form.append('performer', 'YouTube');
+  form.append('audio', new Blob([buf], { type: 'audio/mpeg' }), `${title}.mp3`);
+
+  const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendAudio`, {
+    method: 'POST',
+    body: form,
+  });
+  return r.json();
+}
+
 async function handleUpdate(update, env) {
   const message = update.message || update.channel_post;
   const text = message?.text || '';
@@ -75,18 +93,13 @@ async function handleUpdate(update, env) {
 
     if (statusId) await edit(env, chatId, statusId, '📤 Отправляю файл...');
 
-    const sent = await tg(env, 'sendAudio', {
-      chat_id: chatId,
-      audio: link,
-      title: filename.replace(/\.mp3$/i, ''),
-      performer: 'YouTube',
-    });
+    const sent = await sendAudioFromUrl(env, chatId, link, filename.replace(/\.mp3$/i, ''));
 
     if (!sent.ok) {
       throw new Error(
         /too big/i.test(sent.description || '')
           ? 'файл больше 50 MB — лимит Telegram-бота'
-          : sent.description || 'Telegram не принял файл'
+          : `${sent.description || 'Telegram не принял файл'}\n🔗 ${link}`
       );
     }
 
