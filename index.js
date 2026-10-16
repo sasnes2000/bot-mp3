@@ -1,13 +1,12 @@
-// Telegram-бот: YouTube-ссылка → аудиофайл.
-// По умолчанию аудио берётся напрямую из внутреннего API YouTube (InnerTube).
-// Если задан COBALT_API (свой cobalt с cookies/ключом) — используется он.
+// Telegram-бот: YouTube-ссылка → MP3
+// 1. InnerTube (YouTube напрямую) — основной метод
+// 2. Свой cobalt (COBALT_API) — fallback, если задан
 
 const URL_RE =
   /(https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/|live\/)|youtu\.be\/)[\w-]+)/i;
 
 const INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
 
-// Разные "клиенты" YouTube — у каждого свои правила выдачи ссылок.
 const CLIENTS = [
   { name: 'ANDROID', ver: '20.10.38', sdk: 30, ua: 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip' },
   { name: 'ANDROID_VR', ver: '1.62.27', sdk: 32, ua: 'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12; GB) gzip' },
@@ -24,44 +23,14 @@ const tg = (env, method, payload) =>
 
 const edit = (env, chatId, messageId, text) =>
   tg(env, 'editMessageText', {
-    chat_id: chatId,
-    message_id: messageId,
-    text,
+    chat_id: chatId, message_id: messageId, text,
     disable_web_page_preview: true,
   }).catch(() => {});
 
 const videoId = (url) => (url.match(/(?:v=|youtu\.be\/|shorts\/|live\/)([\w-]{11})/) || [])[1] || null;
+const short = (err) => String(err?.message || err).slice(0, 60);
 
-// Если задан YT_COOKIE (строка cookie с youtube.com) — подписываем запросы, как залогиненный браузер.
-async function authHeaders(env, base) {
-  if (!env.YT_COOKIE) return base;
-  const cookie = env.YT_COOKIE;
-  const headers = { ...base, Cookie: cookie };
-
-  const val = (k) => cookie.match(new RegExp(`(?:^|; )${k}=([^;]+)`))?.[1];
-  const origin = 'https://www.youtube.com';
-  const ts = Math.floor(Date.now() / 1000);
-  const sha1 = async (s) => {
-    const d = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(s));
-    return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
-  };
-
-  const parts = [];
-  for (const [name, label] of [
-    ['SAPISID', 'SAPISIDHASH'],
-    ['__Secure-1PAPISID', 'SAPISID1PHASH'],
-    ['__Secure-3PAPISID', 'SAPISID3PHASH'],
-  ]) {
-    const v = val(name);
-    if (v) parts.push(`${label} ${ts}_${await sha1(`${ts} ${v} ${origin}`)}`);
-  }
-  if (parts.length) headers.Authorization = parts.join(' ');
-  if (val('__Secure-3PAPISID') || val('SAPISID')) headers['X-Origin'] = origin;
-
-  return headers;
-}
-
-// ── 1. InnerTube (прямой запрос к YouTube, без посредников) ──────────────────
+// ── InnerTube (прямой запрос к YouTube) ──────────────────────────────
 
 async function fromYouTube(env, vidId, errors) {
   for (const c of CLIENTS) {
@@ -70,35 +39,44 @@ async function fromYouTube(env, vidId, errors) {
     if (c.screen) client.clientScreen = c.screen;
 
     try {
+      const headers = { 'Content-Type': 'application/json', 'User-Agent': c.ua };
+      if (env.YT_COOKIE) {
+        headers.Cookie = env.YT_COOKIE;
+        // SAPISID auth если есть куки
+        const val = (k) => env.YT_COOKIE.match(new RegExp(`(?:^|; )${k}=([^;]+)`))?.[1];
+        const origin = 'https://www.youtube.com';
+        const ts = Math.floor(Date.now() / 1000);
+        const sha1 = async (s) => {
+          const d = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(s));
+          return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
+        };
+        const parts = [];
+        for (const [name, label] of [
+          ['SAPISID', 'SAPISIDHASH'],
+          ['__Secure-1PAPISID', 'SAPISID1PHASH'],
+          ['__Secure-3PAPISID', 'SAPISID3PHASH'],
+        ]) {
+          const v = val(name);
+          if (v) parts.push(`${label} ${ts}_${await sha1(`${ts} ${v} ${origin}`)}`);
+        }
+        if (parts.length) headers.Authorization = parts.join(' ');
+        if (val('__Secure-3PAPISID') || val('SAPISID')) headers['X-Origin'] = origin;
+      }
+
       const res = await fetch(
         `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}&prettyPrint=false`,
-        {
-          method: 'POST',
-          headers: await authHeaders(env, { 'Content-Type': 'application/json', 'User-Agent': c.ua }),
-          body: JSON.stringify({
-            context: { client },
-            videoId: vidId,
-            contentCheckOk: true,
-            racyCheckOk: true,
-          }),
-        }
+        { method: 'POST', headers, body: JSON.stringify({ context: { client }, videoId: vidId, contentCheckOk: true, racyCheckOk: true }) }
       );
       const data = await res.json().catch(() => ({}));
       const status = data?.playabilityStatus?.status;
 
-      if (status && status !== 'OK') {
-        errors.push(`${c.name}: ${status}`);
-        continue;
-      }
+      if (status && status !== 'OK') { errors.push(`${c.name}: ${status}`); continue; }
 
       const audio = (data?.streamingData?.adaptiveFormats || [])
         .filter((f) => (f.mimeType || '').startsWith('audio') && f.url)
         .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
 
-      if (!audio) {
-        errors.push(`${c.name}: нет прямой ссылки`);
-        continue;
-      }
+      if (!audio) { errors.push(`${c.name}: нет прямой ссылки`); continue; }
 
       const file = await download(audio.url);
       if (file) {
@@ -107,14 +85,12 @@ async function fromYouTube(env, vidId, errors) {
         return { ...file, filename: `${title}.${m4a ? 'm4a' : 'webm'}`, mime: m4a ? 'audio/mp4' : 'audio/webm' };
       }
       errors.push(`${c.name}: файл пустой`);
-    } catch (err) {
-      errors.push(`${c.name}: ${short(err)}`);
-    }
+    } catch (err) { errors.push(`${c.name}: ${short(err)}`); }
   }
   return null;
 }
 
-// ── 2. Свой cobalt (если задан COBALT_API) ───────────────────────────────────
+// ── Свой cobalt (если задан COBALT_API) ──────────────────────────────
 
 async function fromCobalt(env, ytUrl, errors) {
   const api = (env.COBALT_API || '').trim();
@@ -125,31 +101,19 @@ async function fromCobalt(env, ytUrl, errors) {
 
   try {
     const res = await fetch(api, {
-      method: 'POST',
-      headers,
+      method: 'POST', headers,
       body: JSON.stringify({ url: ytUrl, downloadMode: 'audio', audioFormat: 'mp3' }),
     });
     const data = await res.json().catch(() => ({}));
     const link = data.url || data.picker?.[0]?.url;
-    if (!link) {
-      errors.push(`cobalt: ${data.error?.code || data.text || res.status}`);
-      return null;
-    }
+    if (!link) { errors.push(`cobalt: ${data.error?.code || data.text || res.status}`); return null; }
     const file = await download(link);
-    if (!file) {
-      errors.push('cobalt: файл пустой');
-      return null;
-    }
+    if (!file) { errors.push('cobalt: файл пустой'); return null; }
     return { ...file, filename: data.filename || 'audio.mp3', mime: 'audio/mpeg' };
-  } catch (err) {
-    errors.push(`cobalt: ${short(err)}`);
-    return null;
-  }
+  } catch (err) { errors.push(`cobalt: ${short(err)}`); return null; }
 }
 
-// ── Общее ────────────────────────────────────────────────────────────────────
-
-const short = (err) => String(err?.message || err).slice(0, 60);
+// ── Общее ────────────────────────────────────────────────────────────
 
 async function download(url, minBytes = 50000) {
   const res = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } });
@@ -176,11 +140,9 @@ async function sendAudio(env, chatId, buf, title, mime) {
   form.append('performer', 'YouTube');
   form.append('audio', new Blob([buf], { type: mime }), `${title}.m4a`);
 
-  const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendAudio`, {
-    method: 'POST',
-    body: form,
-  });
-  return res.json();
+  return fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendAudio`, {
+    method: 'POST', body: form,
+  }).then(r => r.json());
 }
 
 async function handleUpdate(update, env) {

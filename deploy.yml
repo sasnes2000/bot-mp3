@@ -13,7 +13,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm ci || npm install
+      - run: npm install --no-package-lock
       - name: Deploy to Cloudflare
         uses: cloudflare/wrangler-action@v3
         with:
