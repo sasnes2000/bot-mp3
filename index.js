@@ -79,6 +79,61 @@ async function tryCobalt(env, ytUrl, errs) {
   return null;
 }
 
+const INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
+
+const CLIENTS = [
+  { name: 'ANDROID', ver: '19.09.37', sdk: 30, ua: 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip' },
+  { name: 'ANDROID_VR', ver: '1.60.19', sdk: 32, ua: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; GB) gzip' },
+  { name: 'IOS', ver: '19.09.3', sdk: null, ua: 'com.google.ios.youtube/19.09.3 (iPhone16,2; U; CPU iOS 17_4 like Mac OS X)' },
+];
+
+async function tryInnerTube(env, vidId, errs) {
+  for (const c of CLIENTS) {
+    try {
+      const client = { clientName: c.name, clientVersion: c.ver, hl: 'en', gl: 'US' };
+      if (c.sdk) client.androidSdkVersion = c.sdk;
+      const res = await fetch(
+        `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}&prettyPrint=false`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'User-Agent': c.ua },
+          body: JSON.stringify({
+            context: { client },
+            videoId: vidId,
+            contentCheckOk: true,
+            racyCheckOk: true,
+          }),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      const playability = data?.playabilityStatus?.status;
+      if (playability && playability !== 'OK') {
+        errs.push(`innertube/${c.name} → ${playability}`);
+        continue;
+      }
+      const formats = (data?.streamingData?.adaptiveFormats || []).filter(
+        (f) => (f.mimeType || '').startsWith('audio') && f.url
+      );
+      formats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      if (!formats.length) {
+        errs.push(`innertube/${c.name} → нет прямых аудио-ссылок`);
+        continue;
+      }
+      const f = formats[0];
+      const g = await grab(f.url, 50000);
+      if (g.ok) {
+        const mime = /mp4/.test(f.mimeType) ? 'audio/mp4' : 'audio/webm';
+        const title = data?.videoDetails?.title || 'audio';
+        return { buf: g.buf, filename: `${title}.${mime === 'audio/mp4' ? 'm4a' : 'webm'}`, mime };
+      }
+      errs.push(`innertube/${c.name} → пусто (${g.status} ${g.len})`);
+    } catch (err) {
+      errs.push(`innertube/${c.name} → ${String(err.message || err).slice(0, 50)}`);
+    }
+  }
+  return null;
+}
+
 async function tryPiped(env, vidId, errs) {
   for (const base of list(env, 'PIPED_API', DEFAULT_PIPED)) {
     try {
@@ -132,6 +187,7 @@ async function resolveAudio(env, ytUrl) {
   const errs = [];
   const vid = videoId(ytUrl);
   const got =
+    (vid && (await tryInnerTube(env, vid, errs))) ||
     (await tryCobalt(env, ytUrl, errs)) ||
     (vid && (await tryPiped(env, vid, errs))) ||
     (vid && (await tryInvidious(env, vid, errs)));
