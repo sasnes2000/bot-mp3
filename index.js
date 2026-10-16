@@ -51,8 +51,13 @@ async function resolveAudio(env, ytUrl) {
 
 async function sendAudioFromUrl(env, chatId, link, title) {
   const res = await fetch(link, { redirect: 'follow' });
-  if (!res.ok) throw new Error(`не скачал файл (${res.status}) 🔗 ${link}`);
   const buf = await res.arrayBuffer();
+  if (!res.ok) throw new Error(`не скачал файл (${res.status})`);
+  if (!buf.byteLength) {
+    throw new Error(
+      `пустой файл: status=${res.status} type=${res.headers.get('content-type')} len=${res.headers.get('content-length')}`
+    );
+  }
 
   const form = new FormData();
   form.append('chat_id', String(chatId));
