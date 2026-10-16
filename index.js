@@ -32,7 +32,7 @@ function instances(env) {
 
 async function resolveAudio(env, ytUrl) {
   const urls = instances(env);
-  let lastErr;
+  const errs = [];
   for (const api of urls) {
     try {
       const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
@@ -56,21 +56,19 @@ async function resolveAudio(env, ytUrl) {
           const check = await fetch(link, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } });
           const buf = await check.arrayBuffer();
           if (buf.byteLength) return { buf, filename: data.filename || 'audio.mp3' };
-          lastErr = new Error(`${api} → пустой файл`);
+          errs.push(`${api} → пустой файл`);
         } else {
-          lastErr = new Error(`${api} → нет ссылки`);
+          errs.push(`${api} → нет ссылки`);
         }
       } else {
         const e = data.error;
-        lastErr = new Error(
-          (e && (e.code || (typeof e === 'string' ? e : JSON.stringify(e)))) || data.text || `${api} → ${res.status}`
-        );
+        errs.push(`${api} → ${(e && (e.code || (typeof e === 'string' ? e : JSON.stringify(e)))) || data.text || res.status}`);
       }
     } catch (err) {
-      lastErr = err;
+      errs.push(`${api} → ${String(err.message || err).slice(0, 60)}`);
     }
   }
-  throw lastErr || new Error('все инстансы не сработали');
+  throw new Error(errs.join('\n'));
 }
 
 async function sendAudio(env, chatId, buf, title) {
@@ -125,7 +123,7 @@ async function handleUpdate(update, env) {
 
     if (statusId) await tg(env, 'deleteMessage', { chat_id: chatId, message_id: statusId });
   } catch (err) {
-    const msg = `❌ Не получилось: ${String(err.message || err).slice(0, 600)}`;
+    const msg = `❌ Не получилось:\n${String(err.message || err).slice(0, 900)}`;
     if (statusId) await edit(env, chatId, statusId, msg);
     else await tg(env, 'sendMessage', { chat_id: chatId, text: msg });
   }
