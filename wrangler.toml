@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 # Endpoint конвертера (cobalt-совместимый). Публичный инстанс требует ключ,
 # подставь свой self-hosted инстанс или API-провайдера.
-COBALT_API = "https://api.cobalt.tools/"
+COBALT_API = "https://cobalt-t2jl.onrender.com"
 
 # Секреты (задаются командой, не хранятся в файле):
 #   npx wrangler secret put BOT_TOKEN
