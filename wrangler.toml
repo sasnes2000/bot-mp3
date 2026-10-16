@@ -1,13 +1,15 @@
 name = "ytg-bot"
-main = "index.js"
+main = "src/index.js"
 compatibility_date = "2024-11-01"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-# Endpoint конвертера (cobalt-совместимый). Публичный инстанс требует ключ,
-# подставь свой self-hosted инстанс или API-провайдера.
+# Адрес твоего cobalt (например Railway/Render). Пусто — используем прямой YouTube API.
 COBALT_API = ""
 
-# Секреты (задаются командой, не хранятся в файле):
-#   npx wrangler secret put BOT_TOKEN
-#   npx wrangler secret put WEBHOOK_SECRET
+# Секреты (задаются командой или в Cloudflare → Settings → Variables):
+#   BOT_TOKEN       — токен бота от @BotFather
+#   WEBHOOK_SECRET  — пароль вебхука
+#   YT_COOKIE       — cookie с youtube.com (обход LOGIN_REQUIRED)
+#   COBALT_API      — свой cobalt (если используешь)
+#   COBALT_KEY      — ключ cobalt (если требуется)
