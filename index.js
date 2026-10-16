@@ -1,5 +1,19 @@
+// Telegram-бот: YouTube-ссылка → аудиофайл.
+// По умолчанию аудио берётся напрямую из внутреннего API YouTube (InnerTube).
+// Если задан COBALT_API (свой cobalt с cookies/ключом) — используется он.
+
 const URL_RE =
   /(https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/|live\/)|youtu\.be\/)[\w-]+)/i;
+
+const INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
+
+// Разные "клиенты" YouTube — у каждого свои правила выдачи ссылок.
+const CLIENTS = [
+  { name: 'ANDROID', ver: '20.10.38', sdk: 30, ua: 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip' },
+  { name: 'ANDROID_VR', ver: '1.62.27', sdk: 32, ua: 'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12; GB) gzip' },
+  { name: 'IOS', ver: '20.10.4', sdk: null, ua: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 17_4 like Mac OS X)' },
+  { name: 'WEB_EMBEDDED_PLAYER', ver: '1.20250101.00.00', sdk: null, screen: 'EMBED', ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0' },
+];
 
 const tg = (env, method, payload) =>
   fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
@@ -16,87 +30,17 @@ const edit = (env, chatId, messageId, text) =>
     disable_web_page_preview: true,
   }).catch(() => {});
 
-const DEFAULT_COBALT = ['https://co.wuk.sh/', 'https://cobalt-api.kwiatekmiki.com/'];
+const videoId = (url) => (url.match(/(?:v=|youtu\.be\/|shorts\/|live\/)([\w-]{11})/) || [])[1] || null;
 
-const DEFAULT_PIPED = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.adminforge.de',
-  'https://api.piped.private.coffee',
-  'https://pipedapi.reallyaweso.me',
-  'https://pipedapi.drgns.space',
-  'https://piapi.ggtyler.dev',
-  'https://pipedapi.ducks.party',
-];
+// ── 1. InnerTube (прямой запрос к YouTube, без посредников) ──────────────────
 
-const DEFAULT_INVIDIOUS = [
-  'https://inv.nadeko.net',
-  'https://invidious.nerdvpn.de',
-  'https://yewtu.be',
-  'https://iv.melmac.space',
-];
-
-function videoId(url) {
-  const m = url.match(/(?:v=|youtu\.be\/|shorts\/|live\/)([\w-]{11})/);
-  return m ? m[1] : null;
-}
-
-const list = (env, name, defaults) => {
-  const raw = (env[name] || '').split(',').map((s) => s.trim()).filter(Boolean);
-  return raw.length ? raw : defaults;
-};
-
-async function grab(url, minBytes = 100000) {
-  const res = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } });
-  const ct = res.headers.get('content-type') || '';
-  const buf = await res.arrayBuffer();
-  return { ok: buf.byteLength >= minBytes, status: res.status, ct, buf, len: buf.byteLength };
-}
-
-async function tryCobalt(env, ytUrl, errs) {
-  for (const api of list(env, 'COBALT_API', DEFAULT_COBALT)) {
-    try {
-      const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
-      if (env.COBALT_KEY) headers.Authorization = `Api-Key ${env.COBALT_KEY}`;
-      const res = await fetch(api, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ url: ytUrl, downloadMode: 'audio', audioFormat: 'mp3', filenameStyle: 'basic' }),
-      });
-      const data = await res.json().catch(() => ({}));
-      const link = data.url || (data.picker && data.picker[0] && data.picker[0].url);
-      if (link) {
-        const g = await grab(link);
-        if (g.ok) return { buf: g.buf, filename: data.filename || 'audio.mp3', mime: 'audio/mpeg' };
-        errs.push(`${api} → пусто (${g.len})`);
-      } else {
-        const e = data.error;
-        errs.push(`${api} → ${(e && (e.code || (typeof e === 'string' ? e : JSON.stringify(e)))) || data.text || res.status}`);
-      }
-    } catch (err) {
-      errs.push(`${api} → ${String(err.message || err).slice(0, 50)}`);
-    }
-  }
-  return null;
-}
-
-const INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
-
-const CLIENTS = [
-  { name: 'ANDROID', ver: '20.10.38', sdk: 30, ua: 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip' },
-  { name: 'ANDROID_VR', ver: '1.62.27', sdk: 32, ua: 'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12; GB) gzip' },
-  { name: 'IOS', ver: '20.10.4', sdk: null, ua: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 17_4 like Mac OS X)' },
-  { name: 'MWEB', ver: '2.20250101.01.00', sdk: null, ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X)' },
-  { name: 'WEB', ver: '2.20250101.01.00', sdk: null, ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36' },
-  { name: 'WEB_EMBEDDED_PLAYER', ver: '1.20250101.00.00', sdk: null, screen: 'EMBED', ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36' },
-  { name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', ver: '2.0', sdk: null, screen: 'EMBED', ua: 'Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15' },
-];
-
-async function tryInnerTube(env, vidId, errs) {
+async function fromYouTube(vidId, errors) {
   for (const c of CLIENTS) {
+    const client = { clientName: c.name, clientVersion: c.ver, hl: 'en', gl: 'US' };
+    if (c.sdk) client.androidSdkVersion = c.sdk;
+    if (c.screen) client.clientScreen = c.screen;
+
     try {
-      const client = { clientName: c.name, clientVersion: c.ver, hl: 'en', gl: 'US' };
-      if (c.sdk) client.androidSdkVersion = c.sdk;
-      if (c.screen) client.clientScreen = c.screen;
       const res = await fetch(
         `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}&prettyPrint=false`,
         {
@@ -111,94 +55,89 @@ async function tryInnerTube(env, vidId, errs) {
         }
       );
       const data = await res.json().catch(() => ({}));
-      const ps = data?.playabilityStatus || {};
-      if (ps.status && ps.status !== 'OK') {
-        errs.push(`innertube/${c.name} → ${ps.status}: ${(ps.reason || '').slice(0, 60)}`);
+      const status = data?.playabilityStatus?.status;
+
+      if (status && status !== 'OK') {
+        errors.push(`${c.name}: ${status}`);
         continue;
       }
-      const formats = (data?.streamingData?.adaptiveFormats || []).filter(
-        (f) => (f.mimeType || '').startsWith('audio') && (f.url || f.signatureCipher || f.cipher)
-      );
-      const direct = formats.filter((f) => f.url);
-      direct.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-      if (!direct.length) {
-        errs.push(`innertube/${c.name} → нет URL (форм ${formats.length}${formats.length ? ', нужна расшифровка sig' : ''})`);
+
+      const audio = (data?.streamingData?.adaptiveFormats || [])
+        .filter((f) => (f.mimeType || '').startsWith('audio') && f.url)
+        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+      if (!audio) {
+        errors.push(`${c.name}: нет прямой ссылки`);
         continue;
       }
-      const f = direct[0];
-      const g = await grab(f.url, 50000);
-      if (g.ok) {
-        const mime = /mp4/.test(f.mimeType) ? 'audio/mp4' : 'audio/webm';
+
+      const file = await download(audio.url);
+      if (file) {
+        const m4a = /mp4/.test(audio.mimeType || '');
         const title = data?.videoDetails?.title || 'audio';
-        return { buf: g.buf, filename: `${title}.${mime === 'audio/mp4' ? 'm4a' : 'webm'}`, mime };
+        return { ...file, filename: `${title}.${m4a ? 'm4a' : 'webm'}`, mime: m4a ? 'audio/mp4' : 'audio/webm' };
       }
-      errs.push(`innertube/${c.name} → пусто (${g.status} ${g.len})`);
+      errors.push(`${c.name}: файл пустой`);
     } catch (err) {
-      errs.push(`innertube/${c.name} → ${String(err.message || err).slice(0, 50)}`);
+      errors.push(`${c.name}: ${short(err)}`);
     }
   }
   return null;
 }
 
-async function tryPiped(env, vidId, errs) {
-  for (const base of list(env, 'PIPED_API', DEFAULT_PIPED)) {
-    try {
-      const res = await fetch(`${base}/streams/${vidId}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-      if (!res.ok) {
-        errs.push(`${base} → ${res.status}`);
-        continue;
-      }
-      const data = await res.json();
-      const streams = (data.audioStreams || []).filter((s) => s.url);
-      streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-      if (!streams.length) {
-        errs.push(`${base} → нет аудио (${data.error || '?'})`);
-        continue;
-      }
-      const g = await grab(streams[0].url);
-      if (g.ok) {
-        const ext = /mp4|m4a/.test(streams[0].mimeType || '') ? 'm4a' : 'webm';
-        const mime = ext === 'm4a' ? 'audio/mp4' : 'audio/webm';
-        return { buf: g.buf, filename: `${data.title || 'audio'}.${ext}`, mime };
-      }
-      errs.push(`${base} → пусто (${g.len})`);
-    } catch (err) {
-      errs.push(`${base} → ${String(err.message || err).slice(0, 50)}`);
+// ── 2. Свой cobalt (если задан COBALT_API) ───────────────────────────────────
+
+async function fromCobalt(env, ytUrl, errors) {
+  const api = (env.COBALT_API || '').trim();
+  if (!api) return null;
+
+  const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
+  if (env.COBALT_KEY) headers.Authorization = `Api-Key ${env.COBALT_KEY}`;
+
+  try {
+    const res = await fetch(api, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ url: ytUrl, downloadMode: 'audio', audioFormat: 'mp3' }),
+    });
+    const data = await res.json().catch(() => ({}));
+    const link = data.url || data.picker?.[0]?.url;
+    if (!link) {
+      errors.push(`cobalt: ${data.error?.code || data.text || res.status}`);
+      return null;
     }
+    const file = await download(link);
+    if (!file) {
+      errors.push('cobalt: файл пустой');
+      return null;
+    }
+    return { ...file, filename: data.filename || 'audio.mp3', mime: 'audio/mpeg' };
+  } catch (err) {
+    errors.push(`cobalt: ${short(err)}`);
+    return null;
   }
-  return null;
 }
 
-async function tryInvidious(env, vidId, errs) {
-  for (const base of list(env, 'INVIDIOUS_API', DEFAULT_INVIDIOUS)) {
-    try {
-      let title = 'audio';
-      try {
-        const meta = await fetch(`${base}/api/v1/videos/${vidId}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        if (meta.ok) title = (await meta.json()).title || title;
-      } catch {}
-      const g = await grab(`${base}/latest_version?id=${vidId}&itag=140&local=true`);
-      if (g.ok && /audio|video|octet-stream/.test(g.ct)) {
-        return { buf: g.buf, filename: `${title}.m4a`, mime: 'audio/mp4' };
-      }
-      errs.push(`${base} → ${g.status} ct=${g.ct.slice(0, 20)} len=${g.len}`);
-    } catch (err) {
-      errs.push(`${base} → ${String(err.message || err).slice(0, 50)}`);
-    }
-  }
-  return null;
+// ── Общее ────────────────────────────────────────────────────────────────────
+
+const short = (err) => String(err?.message || err).slice(0, 60);
+
+async function download(url, minBytes = 50000) {
+  const res = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } });
+  const buf = await res.arrayBuffer();
+  return buf.byteLength >= minBytes ? { buf } : null;
 }
 
-async function resolveAudio(env, ytUrl) {
-  const errs = [];
+async function getAudio(env, ytUrl) {
+  const errors = [];
   const vid = videoId(ytUrl);
-  const got =
-    (vid && (await tryInnerTube(env, vid, errs))) ||
-    (await tryCobalt(env, ytUrl, errs)) ||
-    (vid && (await tryPiped(env, vid, errs))) ||
-    (vid && (await tryInvidious(env, vid, errs)));
-  if (got) return got;
-  throw new Error(errs.join('\n'));
+
+  const result =
+    (vid && (await fromYouTube(vid, errors))) ||
+    (await fromCobalt(env, ytUrl, errors));
+
+  if (result) return result;
+  throw new Error(errors.join(' • ') || 'не удалось получить аудио');
 }
 
 async function sendAudio(env, chatId, buf, title, mime) {
@@ -208,11 +147,11 @@ async function sendAudio(env, chatId, buf, title, mime) {
   form.append('performer', 'YouTube');
   form.append('audio', new Blob([buf], { type: mime }), `${title}.m4a`);
 
-  const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendAudio`, {
+  const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendAudio`, {
     method: 'POST',
     body: form,
   });
-  return r.json();
+  return res.json();
 }
 
 async function handleUpdate(update, env) {
@@ -223,34 +162,35 @@ async function handleUpdate(update, env) {
 
   const match = text.match(URL_RE);
   if (!match) {
-    const help = /^\/(start|help)/.test(text.trim())
-      ? 'Привет! 👋\nКинь ссылку на видео YouTube — пришлю MP3 🎵'
-      : 'Пришли ссылку на видео YouTube — пришлю MP3 🎵';
-    await tg(env, 'sendMessage', { chat_id: chatId, text: help });
+    const hello = /^\/(start|help)/.test(text.trim());
+    await tg(env, 'sendMessage', {
+      chat_id: chatId,
+      text: hello
+        ? 'Привет! 👋\nКинь ссылку на видео YouTube — пришлю аудио 🎵'
+        : 'Пришли ссылку на видео YouTube — пришлю аудио 🎵',
+    });
     return;
   }
 
-  const status = await tg(env, 'sendMessage', { chat_id: chatId, text: '⏳ Готовлю MP3...' });
+  const status = await tg(env, 'sendMessage', { chat_id: chatId, text: '⏳ Готовлю аудио...' });
   const statusId = status?.result?.message_id;
 
   try {
-    const { buf, filename, mime } = await resolveAudio(env, match[1]);
-
+    const { buf, filename, mime } = await getAudio(env, match[1]);
     if (statusId) await edit(env, chatId, statusId, '📤 Отправляю файл...');
 
     const sent = await sendAudio(env, chatId, buf, filename.replace(/\.[a-z0-9]+$/i, ''), mime);
-
     if (!sent.ok) {
       throw new Error(
         /too big/i.test(sent.description || '')
-          ? 'файл больше 50 MB — лимит Telegram-бота'
+          ? 'файл больше 50 MB — лимит Telegram'
           : sent.description || 'Telegram не принял файл'
       );
     }
 
     if (statusId) await tg(env, 'deleteMessage', { chat_id: chatId, message_id: statusId });
   } catch (err) {
-    const msg = `❌ Не получилось:\n${String(err.message || err).slice(0, 900)}`;
+    const msg = `❌ Не получилось: ${short(err)}`;
     if (statusId) await edit(env, chatId, statusId, msg);
     else await tg(env, 'sendMessage', { chat_id: chatId, text: msg });
   }
@@ -267,7 +207,6 @@ export default {
       ) {
         return new Response('forbidden', { status: 403 });
       }
-
       const update = await request.json().catch(() => null);
       if (update) ctx.waitUntil(handleUpdate(update, env));
       return new Response('ok');
