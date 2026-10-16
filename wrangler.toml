@@ -1,0 +1,13 @@
+name = "ytg-bot"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# Endpoint конвертера (cobalt-совместимый). Публичный инстанс требует ключ,
+# подставь свой self-hosted инстанс или API-провайдера.
+COBALT_API = "https://api.cobalt.tools/"
+
+# Секреты (задаются командой, не хранятся в файле):
+#   npx wrangler secret put BOT_TOKEN
+#   npx wrangler secret put WEBHOOK_SECRET
