@@ -32,6 +32,35 @@ const edit = (env, chatId, messageId, text) =>
 
 const videoId = (url) => (url.match(/(?:v=|youtu\.be\/|shorts\/|live\/)([\w-]{11})/) || [])[1] || null;
 
+// Если задан YT_COOKIE (строка cookie с youtube.com) — подписываем запросы, как залогиненный браузер.
+async function authHeaders(env, base) {
+  if (!env.YT_COOKIE) return base;
+  const cookie = env.YT_COOKIE;
+  const headers = { ...base, Cookie: cookie };
+
+  const val = (k) => cookie.match(new RegExp(`(?:^|; )${k}=([^;]+)`))?.[1];
+  const origin = 'https://www.youtube.com';
+  const ts = Math.floor(Date.now() / 1000);
+  const sha1 = async (s) => {
+    const d = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(s));
+    return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  };
+
+  const parts = [];
+  for (const [name, label] of [
+    ['SAPISID', 'SAPISIDHASH'],
+    ['__Secure-1PAPISID', 'SAPISID1PHASH'],
+    ['__Secure-3PAPISID', 'SAPISID3PHASH'],
+  ]) {
+    const v = val(name);
+    if (v) parts.push(`${label} ${ts}_${await sha1(`${ts} ${v} ${origin}`)}`);
+  }
+  if (parts.length) headers.Authorization = parts.join(' ');
+  if (val('__Secure-3PAPISID') || val('SAPISID')) headers['X-Origin'] = origin;
+
+  return headers;
+}
+
 // ── 1. InnerTube (прямой запрос к YouTube, без посредников) ──────────────────
 
 async function fromYouTube(vidId, errors) {
@@ -45,7 +74,7 @@ async function fromYouTube(vidId, errors) {
         `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}&prettyPrint=false`,
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'User-Agent': c.ua },
+          headers: await authHeaders(env, { 'Content-Type': 'application/json', 'User-Agent': c.ua }),
           body: JSON.stringify({
             context: { client },
             videoId: vidId,
