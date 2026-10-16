@@ -90,9 +90,12 @@ async function tryInvidious(env, vidId, errs) {
         `${base}/latest_version?id=${vidId}&itag=140&local=true`,
         { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } }
       );
+      const ct = res.headers.get('content-type') || '';
       const buf = await res.arrayBuffer();
-      if (buf.byteLength > 1000) return { buf, filename: `${title}.m4a`, mime: 'audio/mp4' };
-      errs.push(`${base} → пусто (${res.status})`);
+      if (buf.byteLength > 100000 && /audio|video|octet-stream/.test(ct)) {
+        return { buf, filename: `${title}.m4a`, mime: 'audio/mp4' };
+      }
+      errs.push(`${base} → ${res.status} ct=${ct} len=${buf.byteLength}`);
     } catch (err) {
       errs.push(`${base} → ${String(err.message || err).slice(0, 50)}`);
     }
