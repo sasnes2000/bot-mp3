@@ -16,18 +16,23 @@ const edit = (env, chatId, messageId, text) =>
     disable_web_page_preview: true,
   }).catch(() => {});
 
-const DEFAULT_COBALT = [
-  'https://co.wuk.sh/',
-  'https://cobalt-api.kwiatekmiki.com/',
+const DEFAULT_COBALT = ['https://co.wuk.sh/', 'https://cobalt-api.kwiatekmiki.com/'];
+
+const DEFAULT_PIPED = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.adminforge.de',
+  'https://api.piped.private.coffee',
+  'https://pipedapi.reallyaweso.me',
+  'https://pipedapi.drgns.space',
+  'https://piapi.ggtyler.dev',
+  'https://pipedapi.ducks.party',
 ];
 
 const DEFAULT_INVIDIOUS = [
   'https://inv.nadeko.net',
   'https://invidious.nerdvpn.de',
   'https://yewtu.be',
-  'https://invidious.f5.si',
   'https://iv.melmac.space',
-  'https://invidious.privacyredirect.com',
 ];
 
 function videoId(url) {
@@ -35,38 +40,34 @@ function videoId(url) {
   return m ? m[1] : null;
 }
 
-function cobaltList(env) {
-  const raw = (env.COBALT_API || '').split(',').map((s) => s.trim()).filter(Boolean);
-  return (raw.length ? raw : DEFAULT_COBALT).map((u) => (u.endsWith('/') ? u : u + '/'));
-}
+const list = (env, name, defaults) => {
+  const raw = (env[name] || '').split(',').map((s) => s.trim()).filter(Boolean);
+  return raw.length ? raw : defaults;
+};
 
-function invidiousList(env) {
-  const raw = (env.INVIDIOUS_API || '').split(',').map((s) => s.trim()).filter(Boolean);
-  return (raw.length ? raw : DEFAULT_INVIDIOUS).map((u) => u.replace(/\/$/, ''));
+async function grab(url, minBytes = 100000) {
+  const res = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } });
+  const ct = res.headers.get('content-type') || '';
+  const buf = await res.arrayBuffer();
+  return { ok: buf.byteLength >= minBytes, status: res.status, ct, buf, len: buf.byteLength };
 }
 
 async function tryCobalt(env, ytUrl, errs) {
-  for (const api of cobaltList(env)) {
+  for (const api of list(env, 'COBALT_API', DEFAULT_COBALT)) {
     try {
       const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
       if (env.COBALT_KEY) headers.Authorization = `Api-Key ${env.COBALT_KEY}`;
       const res = await fetch(api, {
         method: 'POST',
         headers,
-        body: JSON.stringify({
-          url: ytUrl,
-          downloadMode: 'audio',
-          audioFormat: 'mp3',
-          filenameStyle: 'basic',
-        }),
+        body: JSON.stringify({ url: ytUrl, downloadMode: 'audio', audioFormat: 'mp3', filenameStyle: 'basic' }),
       });
       const data = await res.json().catch(() => ({}));
       const link = data.url || (data.picker && data.picker[0] && data.picker[0].url);
       if (link) {
-        const check = await fetch(link, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } });
-        const buf = await check.arrayBuffer();
-        if (buf.byteLength) return { buf, filename: data.filename || 'audio.mp3', mime: 'audio/mpeg' };
-        errs.push(`${api} → пустой файл`);
+        const g = await grab(link);
+        if (g.ok) return { buf: g.buf, filename: data.filename || 'audio.mp3', mime: 'audio/mpeg' };
+        errs.push(`${api} → пусто (${g.len})`);
       } else {
         const e = data.error;
         errs.push(`${api} → ${(e && (e.code || (typeof e === 'string' ? e : JSON.stringify(e)))) || data.text || res.status}`);
@@ -78,24 +79,48 @@ async function tryCobalt(env, ytUrl, errs) {
   return null;
 }
 
-async function tryInvidious(env, vidId, errs) {
-  for (const base of invidiousList(env)) {
+async function tryPiped(env, vidId, errs) {
+  for (const base of list(env, 'PIPED_API', DEFAULT_PIPED)) {
     try {
-      let title = 'YouTube';
+      const res = await fetch(`${base}/streams/${vidId}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (!res.ok) {
+        errs.push(`${base} → ${res.status}`);
+        continue;
+      }
+      const data = await res.json();
+      const streams = (data.audioStreams || []).filter((s) => s.url);
+      streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      if (!streams.length) {
+        errs.push(`${base} → нет аудио (${data.error || '?'})`);
+        continue;
+      }
+      const g = await grab(streams[0].url);
+      if (g.ok) {
+        const ext = /mp4|m4a/.test(streams[0].mimeType || '') ? 'm4a' : 'webm';
+        const mime = ext === 'm4a' ? 'audio/mp4' : 'audio/webm';
+        return { buf: g.buf, filename: `${data.title || 'audio'}.${ext}`, mime };
+      }
+      errs.push(`${base} → пусто (${g.len})`);
+    } catch (err) {
+      errs.push(`${base} → ${String(err.message || err).slice(0, 50)}`);
+    }
+  }
+  return null;
+}
+
+async function tryInvidious(env, vidId, errs) {
+  for (const base of list(env, 'INVIDIOUS_API', DEFAULT_INVIDIOUS)) {
+    try {
+      let title = 'audio';
       try {
         const meta = await fetch(`${base}/api/v1/videos/${vidId}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
         if (meta.ok) title = (await meta.json()).title || title;
       } catch {}
-      const res = await fetch(
-        `${base}/latest_version?id=${vidId}&itag=140&local=true`,
-        { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } }
-      );
-      const ct = res.headers.get('content-type') || '';
-      const buf = await res.arrayBuffer();
-      if (buf.byteLength > 100000 && /audio|video|octet-stream/.test(ct)) {
-        return { buf, filename: `${title}.m4a`, mime: 'audio/mp4' };
+      const g = await grab(`${base}/latest_version?id=${vidId}&itag=140&local=true`);
+      if (g.ok && /audio|video|octet-stream/.test(g.ct)) {
+        return { buf: g.buf, filename: `${title}.m4a`, mime: 'audio/mp4' };
       }
-      errs.push(`${base} → ${res.status} ct=${ct} len=${buf.byteLength}`);
+      errs.push(`${base} → ${g.status} ct=${g.ct.slice(0, 20)} len=${g.len}`);
     } catch (err) {
       errs.push(`${base} → ${String(err.message || err).slice(0, 50)}`);
     }
@@ -105,7 +130,11 @@ async function tryInvidious(env, vidId, errs) {
 
 async function resolveAudio(env, ytUrl) {
   const errs = [];
-  const got = (await tryCobalt(env, ytUrl, errs)) || (await tryInvidious(env, videoId(ytUrl), errs));
+  const vid = videoId(ytUrl);
+  const got =
+    (await tryCobalt(env, ytUrl, errs)) ||
+    (vid && (await tryPiped(env, vid, errs))) ||
+    (vid && (await tryInvidious(env, vid, errs)));
   if (got) return got;
   throw new Error(errs.join('\n'));
 }
@@ -115,7 +144,7 @@ async function sendAudio(env, chatId, buf, title, mime) {
   form.append('chat_id', String(chatId));
   form.append('title', title);
   form.append('performer', 'YouTube');
-  form.append('audio', new Blob([buf], { type: mime }), `${title}.mp3`);
+  form.append('audio', new Blob([buf], { type: mime }), `${title}.m4a`);
 
   const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendAudio`, {
     method: 'POST',
