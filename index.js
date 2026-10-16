@@ -38,7 +38,14 @@ async function resolveAudio(env, ytUrl) {
     (data.picker && data.picker[0] && data.picker[0].url) ||
     null;
 
-  if (!link) throw new Error(data.text || data.error || `конвертер вернул ${res.status}`);
+  if (!link) {
+    const e = data.error;
+    const reason =
+      (e && (typeof e === 'string' ? e : e.code || e.text || JSON.stringify(e))) ||
+      data.text ||
+      `конвертер вернул ${res.status}`;
+    throw new Error(reason);
+  }
   return { link, filename: data.filename || 'audio.mp3' };
 }
 
