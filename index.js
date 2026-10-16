@@ -16,28 +16,40 @@ const edit = (env, chatId, messageId, text) =>
     disable_web_page_preview: true,
   }).catch(() => {});
 
-const DEFAULT_INSTANCES = [
+const DEFAULT_COBALT = [
   'https://co.wuk.sh/',
   'https://cobalt-api.kwiatekmiki.com/',
-  'https://api.cobalt.best/',
-  'https://cobalt.255x.ru/',
-  'https://api.cobalt.tools/',
 ];
 
-function instances(env) {
-  const raw = (env.COBALT_API || '').split(',').map((s) => s.trim()).filter(Boolean);
-  const list = raw.length ? raw : DEFAULT_INSTANCES;
-  return list.map((u) => (u.endsWith('/') ? u : u + '/'));
+const DEFAULT_INVIDIOUS = [
+  'https://inv.nadeko.net',
+  'https://invidious.nerdvpn.de',
+  'https://yewtu.be',
+  'https://invidious.f5.si',
+  'https://iv.melmac.space',
+  'https://invidious.privacyredirect.com',
+];
+
+function videoId(url) {
+  const m = url.match(/(?:v=|youtu\.be\/|shorts\/|live\/)([\w-]{11})/);
+  return m ? m[1] : null;
 }
 
-async function resolveAudio(env, ytUrl) {
-  const urls = instances(env);
-  const errs = [];
-  for (const api of urls) {
+function cobaltList(env) {
+  const raw = (env.COBALT_API || '').split(',').map((s) => s.trim()).filter(Boolean);
+  return (raw.length ? raw : DEFAULT_COBALT).map((u) => (u.endsWith('/') ? u : u + '/'));
+}
+
+function invidiousList(env) {
+  const raw = (env.INVIDIOUS_API || '').split(',').map((s) => s.trim()).filter(Boolean);
+  return (raw.length ? raw : DEFAULT_INVIDIOUS).map((u) => u.replace(/\/$/, ''));
+}
+
+async function tryCobalt(env, ytUrl, errs) {
+  for (const api of cobaltList(env)) {
     try {
       const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
       if (env.COBALT_KEY) headers.Authorization = `Api-Key ${env.COBALT_KEY}`;
-
       const res = await fetch(api, {
         method: 'POST',
         headers,
@@ -48,35 +60,59 @@ async function resolveAudio(env, ytUrl) {
           filenameStyle: 'basic',
         }),
       });
-
       const data = await res.json().catch(() => ({}));
-      if (data.status === 'tunnel' || data.status === 'redirect') {
-        const link = data.url || (data.picker && data.picker[0] && data.picker[0].url);
-        if (link) {
-          const check = await fetch(link, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } });
-          const buf = await check.arrayBuffer();
-          if (buf.byteLength) return { buf, filename: data.filename || 'audio.mp3' };
-          errs.push(`${api} → пустой файл`);
-        } else {
-          errs.push(`${api} → нет ссылки`);
-        }
+      const link = data.url || (data.picker && data.picker[0] && data.picker[0].url);
+      if (link) {
+        const check = await fetch(link, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const buf = await check.arrayBuffer();
+        if (buf.byteLength) return { buf, filename: data.filename || 'audio.mp3', mime: 'audio/mpeg' };
+        errs.push(`${api} → пустой файл`);
       } else {
         const e = data.error;
         errs.push(`${api} → ${(e && (e.code || (typeof e === 'string' ? e : JSON.stringify(e)))) || data.text || res.status}`);
       }
     } catch (err) {
-      errs.push(`${api} → ${String(err.message || err).slice(0, 60)}`);
+      errs.push(`${api} → ${String(err.message || err).slice(0, 50)}`);
     }
   }
+  return null;
+}
+
+async function tryInvidious(env, vidId, errs) {
+  for (const base of invidiousList(env)) {
+    try {
+      let title = 'YouTube';
+      try {
+        const meta = await fetch(`${base}/api/v1/videos/${vidId}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        if (meta.ok) title = (await meta.json()).title || title;
+      } catch {}
+      const res = await fetch(
+        `${base}/latest_version?id=${vidId}&itag=140&local=true`,
+        { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } }
+      );
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength > 1000) return { buf, filename: `${title}.m4a`, mime: 'audio/mp4' };
+      errs.push(`${base} → пусто (${res.status})`);
+    } catch (err) {
+      errs.push(`${base} → ${String(err.message || err).slice(0, 50)}`);
+    }
+  }
+  return null;
+}
+
+async function resolveAudio(env, ytUrl) {
+  const errs = [];
+  const got = (await tryCobalt(env, ytUrl, errs)) || (await tryInvidious(env, videoId(ytUrl), errs));
+  if (got) return got;
   throw new Error(errs.join('\n'));
 }
 
-async function sendAudio(env, chatId, buf, title) {
+async function sendAudio(env, chatId, buf, title, mime) {
   const form = new FormData();
   form.append('chat_id', String(chatId));
   form.append('title', title);
   form.append('performer', 'YouTube');
-  form.append('audio', new Blob([buf], { type: 'audio/mpeg' }), `${title}.mp3`);
+  form.append('audio', new Blob([buf], { type: mime }), `${title}.mp3`);
 
   const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendAudio`, {
     method: 'POST',
@@ -100,18 +136,15 @@ async function handleUpdate(update, env) {
     return;
   }
 
-  const status = await tg(env, 'sendMessage', {
-    chat_id: chatId,
-    text: '⏳ Готовлю MP3...',
-  });
+  const status = await tg(env, 'sendMessage', { chat_id: chatId, text: '⏳ Готовлю MP3...' });
   const statusId = status?.result?.message_id;
 
   try {
-    const { buf, filename } = await resolveAudio(env, match[1]);
+    const { buf, filename, mime } = await resolveAudio(env, match[1]);
 
     if (statusId) await edit(env, chatId, statusId, '📤 Отправляю файл...');
 
-    const sent = await sendAudio(env, chatId, buf, filename.replace(/\.mp3$/i, ''));
+    const sent = await sendAudio(env, chatId, buf, filename.replace(/\.[a-z0-9]+$/i, ''), mime);
 
     if (!sent.ok) {
       throw new Error(
