@@ -63,7 +63,7 @@ async function authHeaders(env, base) {
 
 // ── 1. InnerTube (прямой запрос к YouTube, без посредников) ──────────────────
 
-async function fromYouTube(vidId, errors) {
+async function fromYouTube(env, vidId, errors) {
   for (const c of CLIENTS) {
     const client = { clientName: c.name, clientVersion: c.ver, hl: 'en', gl: 'US' };
     if (c.sdk) client.androidSdkVersion = c.sdk;
@@ -162,7 +162,7 @@ async function getAudio(env, ytUrl) {
   const vid = videoId(ytUrl);
 
   const result =
-    (vid && (await fromYouTube(vid, errors))) ||
+    (vid && (await fromYouTube(env, vid, errors))) ||
     (await fromCobalt(env, ytUrl, errors));
 
   if (result) return result;
