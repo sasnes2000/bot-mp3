@@ -46,7 +46,7 @@ async function resolveAudio(env, ytUrl) {
       `конвертер вернул ${res.status}`;
     throw new Error(reason);
   }
-  return { link, filename: data.filename || 'audio.mp3' };
+  return { link, filename: data.filename || 'audio.mp3', status: data.status };
 }
 
 async function sendAudioFromUrl(env, chatId, link, title) {
@@ -105,7 +105,7 @@ async function handleUpdate(update, env) {
 
     if (statusId) await tg(env, 'deleteMessage', { chat_id: chatId, message_id: statusId });
   } catch (err) {
-    const msg = `❌ Не получилось: ${String(err.message || err).slice(0, 180)}`;
+    const msg = `❌ Не получилось: ${String(err.message || err).slice(0, 600)}`;
     if (statusId) await edit(env, chatId, statusId, msg);
     else await tg(env, 'sendMessage', { chat_id: chatId, text: msg });
   }
