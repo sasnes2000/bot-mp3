@@ -230,14 +230,17 @@ async function convertNoTube(videoUrl) {
   throw new Error('noTube не выдал прямую ссылку на MP3 (страница без кнопки скачивания)');
 }
 
-// Cloudflare's streamed multipart requests can be refused by Telegram.
-// For short audio, buffer the verified MP3 and let FormData generate the
-// multipart body (including boundary and length) automatically.
-const MAX_BUFFERED_MP3_BYTES = 20 * 1024 * 1024;
+// Telegram Bot API sendAudio supports files up to 50 MiB.
+// FormData uploads are buffered; large files may still exceed Cloudflare's
+// 128 MiB Worker memory or the request's timeout, especially concurrently.
+// This sets the bot's maximum allowed MP3 size, not a guarantee of delivery.
+// MP3 fetch and Telegram upload each have an individual 40s timeout.
+// CAUTION: ctx.waitUntil has a 30-second overall post-response execution window
+// on Cloudflare Pages, including noTube conversion, so these are not additive guarantees.
 
 async function sendMp3(env, chatId, track) {
   const response = await fetch(track.url, {
-    signal: AbortSignal.timeout(18000),
+    signal: AbortSignal.timeout(40000),
     headers: { 'Accept': 'audio/mpeg,audio/*;q=0.9,*/*;q=0.1' },
   });
   if (!response.ok) throw new Error(`noTube MP3 HTTP ${response.status}`);
@@ -246,11 +249,11 @@ async function sendMp3(env, chatId, track) {
     throw new Error(`noTube вернул не аудио: ${mime}`);
   }
   const declaredLength = Number(response.headers.get('content-length') || 0);
-  if (declaredLength > MAX_BUFFERED_MP3_BYTES) {
-    throw new Error('Файл больше 20 МБ: безопасный лимит Cloudflare Pages');
+  if (declaredLength > MAX_MP3_BYTES) {
+    throw new Error('Файл больше 50 МБ: лимит Telegram Bot API');
   }
   const buffer = await response.arrayBuffer();
-  if (!buffer.byteLength || buffer.byteLength > MAX_BUFFERED_MP3_BYTES) {
+  if (!buffer.byteLength || buffer.byteLength > MAX_MP3_BYTES) {
     throw new Error(`Недопустимый размер MP3: ${buffer.byteLength} байт`);
   }
   const b = new Uint8Array(buffer);
@@ -266,7 +269,7 @@ async function sendMp3(env, chatId, track) {
   const posted = await fetch(`${TELEGRAM_URL}${env.TELEGRAM_BOT_TOKEN}/sendAudio`, {
     method: 'POST',
     body: form,
-    signal: AbortSignal.timeout(18000),
+    signal: AbortSignal.timeout(40000),
   });
   // Avoid logging tokens, file URLs, or request headers. Telegram description is enough.
   const body = await posted.text();
