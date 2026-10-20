@@ -43,10 +43,71 @@ function noTubeTitle(metadata) {
   }
   return null;
 }
-const HELP_TEXT =
-  '🎧 Привет! Пришли ссылку на YouTube или YouTube Shorts, и я попробую отправить MP3.\n\n' +
-  '✅ Hi! Send me a YouTube or YouTube Shorts link, and I'll try to send you the MP3.\n\n' +
-  
+// Bot translations. Selection is remembered per Telegram user in Cloudflare KV.
+const MESSAGES = {
+  ru: {
+    choose: '🌍 Выбери язык / Choose your language:',
+    saved: '✅ Выбран русский язык.',
+    help: '🎧 Привет! Пришли ссылку на YouTube или YouTube Shorts, и я попробую отправить MP3.\n\n' +
+      '✅ Обычные видео и Shorts\n' +
+      '⚠️ Конвертация через noTube может быть недоступна.\n' +
+      'Скачивай только контент, на который у тебя есть права.\n\n' +
+      '🌍 Сменить язык: /language',
+    badLink: '🔗 Отправь ссылку вида https://youtu.be/VIDEO_ID или на YouTube Shorts.',
+    progress: '⏳ Получаю MP3… Подожди немного.',
+    failure: '❌ MP3 не отправился. Подробная причина записана в Cloudflare Logs.',
+  },
+  en: {
+    choose: '🌍 Choose your language / Выбери язык:',
+    saved: '✅ English selected.',
+    help: '🎧 Hi! Send me a YouTube or YouTube Shorts link, and I’ll try to send you an MP3.\n\n' +
+      '✅ Regular videos and Shorts\n' +
+      '⚠️ Conversion via noTube may be unavailable.\n' +
+      'Only download content you have the rights to use.\n\n' +
+      '🌍 Change language: /language',
+    badLink: '🔗 Send a link like https://youtu.be/VIDEO_ID or a YouTube Shorts link.',
+    progress: '⏳ Getting your MP3… Please wait.',
+    failure: '❌ Could not send the MP3. The detailed error is in Cloudflare Logs.',
+  },
+};
+
+const LANGUAGE_BUTTONS = {
+  keyboard: [[{ text: '🇷🇺 Русский' }, { text: '🇬🇧 English' }]],
+  resize_keyboard: true,
+  one_time_keyboard: true,
+  input_field_placeholder: 'Choose language / Выберите язык',
+};
+const REMOVE_KEYBOARD = { remove_keyboard: true };
+
+function defaultLanguage(user) {
+  return String(user?.language_code || '').toLowerCase().startsWith('ru') ? 'ru' : 'en';
+}
+function languageKey(userId) { return `telegram_user_lang:${userId}`; }
+function validKv(kv) {
+  return Boolean(kv && typeof kv.get === 'function' && typeof kv.put === 'function');
+}
+async function preferredLanguage(env, user) {
+  const fallback = defaultLanguage(user);
+  if (!validKv(env.LANG_KV) || !user?.id) return fallback;
+  try {
+    const saved = await env.LANG_KV.get(languageKey(user.id));
+    return saved === 'ru' || saved === 'en' ? saved : fallback;
+  } catch (error) {
+    console.error('LANG_KV read failed:', String(error));
+    return fallback;
+  }
+}
+async function chooseLanguage(env, user, language) {
+  if (!validKv(env.LANG_KV) || !user?.id) return false;
+  try {
+    await env.LANG_KV.put(languageKey(user.id), language);
+    return true;
+  } catch (error) {
+    console.error('LANG_KV write failed:', String(error));
+    return false;
+  }
+}
+
 function getIdFromMessage(messageText) {
   const match = String(messageText || '').match(/(?:https?:\/\/)?(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)\/[^\s<>"']+/i);
   if (!match) return null;
@@ -89,8 +150,10 @@ async function telegram(env, method, params, timeoutMs = 12000) {
   return data.result;
 }
 
-async function sendText(env, chatId, text) {
-  return telegram(env, 'sendMessage', { chat_id: chatId, text });
+async function sendText(env, chatId, text, replyMarkup = null) {
+  const params = { chat_id: chatId, text };
+  if (replyMarkup) params.reply_markup = replyMarkup;
+  return telegram(env, 'sendMessage', params);
 }
 
 function safeAudioUrl(value, baseUrl = 'https://notube.net/') {
@@ -220,19 +283,43 @@ async function handleUpdate(env, update) {
   const msg = update?.message;
   if (!msg || !msg.chat?.id) return;
   const chatId = msg.chat.id;
+  const user = msg.from;
   const allowlist = String(env.ALLOWED_USER_IDS || '').trim();
-  if (allowlist && !allowlist.split(',').map(x => x.trim()).includes(String(msg.from?.id || ''))) return;
-  const input = String(msg.text || msg.caption || '');
-  if (!input || /^\/(start|help)(?:@\w+)?(?:\s|$)/i.test(input)) {
-    await sendText(env, chatId, HELP_TEXT);
+  if (allowlist && !allowlist.split(',').map(x => x.trim()).includes(String(user?.id || ''))) return;
+  const input = String(msg.text || msg.caption || '').trim();
+
+  // Reply keyboard buttons produce ordinary Telegram messages. No callback_query
+  // webhook permission or webhook re-registration is required.
+  if (input === '🇷🇺 Русский' || input === '🇬🇧 English') {
+    const lang = input === '🇷🇺 Русский' ? 'ru' : 'en';
+    if (!(await chooseLanguage(env, user, lang))) {
+      await sendText(env, chatId,
+        '⚠️ Не удалось сохранить язык. Добавь KV binding LANG_KV в Cloudflare Pages.\n' +
+        '⚠️ Language could not be saved. Add the LANG_KV binding in Cloudflare Pages.',
+        REMOVE_KEYBOARD);
+      return;
+    }
+    await sendText(env, chatId, `${MESSAGES[lang].saved}\n\n${MESSAGES[lang].help}`, REMOVE_KEYBOARD);
+    return;
+  }
+
+  if (/^\/(?:start|language|lang)(?:@\w+)?(?:\s|$)/i.test(input)) {
+    await sendText(env, chatId, MESSAGES[(await preferredLanguage(env, user))].choose, LANGUAGE_BUTTONS);
+    return;
+  }
+
+  const lang = await preferredLanguage(env, user);
+  const t = MESSAGES[lang];
+  if (!input || /^\/help(?:@\w+)?(?:\s|$)/i.test(input)) {
+    await sendText(env, chatId, t.help);
     return;
   }
   const videoUrl = getIdFromMessage(input);
   if (!videoUrl) {
-    await sendText(env, chatId, '🔗 Отправь ссылку вида https://youtu.be/VIDEO_ID или на YouTube Shorts.');
+    await sendText(env, chatId, t.badLink);
     return;
   }
-  await sendText(env, chatId, '⏳ Получаю MP3… Подожди немного.');
+  await sendText(env, chatId, t.progress);
   try {
     const titleRequest = getYoutubeTitle(videoUrl);
     const track = await convertNoTube(videoUrl);
@@ -241,7 +328,7 @@ async function handleUpdate(env, update) {
   } catch (error) {
     console.error('noTube MP3 conversion error:', String(error));
     try {
-      await sendText(env, chatId, '❌ MP3 не отправился. Подробная причина записана в Cloudflare Logs.');
+      await sendText(env, chatId, t.failure);
     } catch (sendError) {
       console.error('Could not send error message:', String(sendError));
     }
@@ -252,7 +339,7 @@ export default {
   async fetch(request, env, ctx) {
     const u = new URL(request.url);
     if (u.pathname === '/health' && request.method === 'GET') {
-      return Response.json({ ok: true, configured: configured(env), service: 'YouTube → Telegram MP3' });
+      return Response.json({ ok: true, configured: configured(env), service: 'YouTube → Telegram MP3', language_storage: validKv(env.LANG_KV) });
     }
     if (u.pathname === '/setup' && request.method === 'GET') {
       if (!configured(env)) return new Response('Set TELEGRAM_BOT_TOKEN and SETUP_KEY secrets in Cloudflare Pages.', {status: 503});
