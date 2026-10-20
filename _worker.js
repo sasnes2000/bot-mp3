@@ -4,6 +4,45 @@
 const NOTUBE_HOST = 'https://s47.notube.net'; // Seen in an unofficial public client; may change.
 const MAX_MP3_BYTES = 50 * 1024 * 1024;
 const TELEGRAM_URL = 'https://api.telegram.org/bot';
+
+// YouTube public oEmbed metadata: title only, no API key required.
+// If unavailable, use the title returned by noTube, when present.
+async function getYoutubeTitle(videoUrl) {
+  try {
+    const url = `https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(videoUrl)}`;
+    const response = await fetch(url, { signal: AbortSignal.timeout(4500) });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const title = typeof data?.title === 'string' ? data.title.trim() : '';
+    return title || null;
+  } catch (error) {
+    console.warn('YouTube title lookup unavailable:', String(error));
+    return null;
+  }
+}
+
+function safeMp3FileName(title) {
+  let name = String(title || 'YouTube MP3')
+    .normalize('NFC')
+    .replace(/[\x00-\x1F\x7F\/\\:*?"<>|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/[. ]+$/g, '')
+    .trim();
+  // Keep Cyrillic, accents and emoji. Limit length to avoid overly long names.
+  if (!name) name = 'YouTube MP3';
+  if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(name)) name = `_${name}`;
+  name = Array.from(name).slice(0, 150).join('').replace(/[. ]+$/g, '');
+  return `${name || 'YouTube MP3'}.mp3`;
+}
+
+function noTubeTitle(metadata) {
+  for (const candidate of [metadata?.title, metadata?.name, metadata?.name_mp4]) {
+    if (typeof candidate !== 'string') continue;
+    const title = candidate.replace(/\.(?:mp3|mp4)$/i, '').trim();
+    if (title) return title;
+  }
+  return null;
+}
 const HELP_TEXT =
   '🎧 Привет! Пришли ссылку на YouTube или YouTube Shorts, и я попробую отправить MP3.\n\n' +
   '✅ Обычные видео и Shorts\n' +
@@ -124,7 +163,7 @@ async function convertNoTube(videoUrl) {
     });
     if (!page.ok) throw new Error(`noTube download page HTTP ${page.status}`);
     const link = extractDownloadLink(await page.text(), page.url || pageUrl);
-    if (link) return { url: link, title: 'YouTube MP3', size: 0 };
+    if (link) return { url: link, title: noTubeTitle(weight) || 'YouTube MP3', size: 0 };
     if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 1200));
   }
   throw new Error('noTube не выдал прямую ссылку на MP3 (страница без кнопки скачивания)');
@@ -161,8 +200,8 @@ async function sendMp3(env, chatId, track) {
   console.log('MP3 bytes verified:', buffer.byteLength, 'mime:', mime || 'not supplied');
   const form = new FormData();
   form.set('chat_id', String(chatId));
-  form.set('title', String(track.title || 'YouTube MP3').slice(0, 64));
-  form.set('audio', new Blob([buffer], {type: 'audio/mpeg'}), 'audio.mp3');
+  form.set('title', String(track.title || 'YouTube MP3').slice(0, 200));
+  form.set('audio', new Blob([buffer], {type: 'audio/mpeg'}), safeMp3FileName(track.title));
   const posted = await fetch(`${TELEGRAM_URL}${env.TELEGRAM_BOT_TOKEN}/sendAudio`, {
     method: 'POST',
     body: form,
@@ -197,7 +236,9 @@ async function handleUpdate(env, update) {
   }
   await sendText(env, chatId, '⏳ Получаю MP3… Подожди немного.');
   try {
+    const titleRequest = getYoutubeTitle(videoUrl);
     const track = await convertNoTube(videoUrl);
+    track.title = (await titleRequest) || track.title;
     await sendMp3(env, chatId, track);
   } catch (error) {
     console.error('noTube MP3 conversion error:', String(error));
