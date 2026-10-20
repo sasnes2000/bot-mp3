@@ -45,10 +45,8 @@ function noTubeTitle(metadata) {
 }
 const HELP_TEXT =
   '🎧 Привет! Пришли ссылку на YouTube или YouTube Shorts, и я попробую отправить MP3.\n\n' +
-  '✅ Обычные видео и Shorts\n' +
-  '⚠️ noTube использует неофициальные внутренние запросы; доступность не гарантируется.\n' +
-  'Скачивай только контент, на который у тебя есть права.';
-
+  '✅ Hi! Send me a YouTube or YouTube Shorts link, and I'll try to send you the MP3.\n\n' +
+  
 function getIdFromMessage(messageText) {
   const match = String(messageText || '').match(/(?:https?:\/\/)?(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)\/[^\s<>"']+/i);
   if (!match) return null;
