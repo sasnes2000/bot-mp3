@@ -1,6 +1,8 @@
 // Telegram YouTube -> MP3 bot for Cloudflare Pages (drag-and-drop ZIP).
-// Conversion is performed by the external YTMP3.GE API, not by Cloudflare.
+// Conversion is performed by third-party services, not Cloudflare.
+// V2: prefer direct MP3 bytes, fall back to old provider, never send HTML as audio.
 const CONVERTER_URL = 'https://ytmp3.ge/api/convert';
+const DIRECT_MP3_URL = 'https://api.omegatech.app/api/download/ytmp3';
 const MAX_MP3_BYTES = 50 * 1024 * 1024;
 const TELEGRAM_URL = 'https://api.telegram.org/bot';
 const HELP_TEXT =
@@ -104,23 +106,37 @@ async function sendMp3(env, chatId, track) {
 }
 
 async function uploadMp3Stream(env, chatId, track) {
-  const response = await fetch(track.url, { signal: AbortSignal.timeout(11000) });
+  const response = await fetch(track.url, { signal: AbortSignal.timeout(9000) });
   if (!response.ok || !response.body) throw new Error(`Не удалось получить MP3: HTTP ${response.status}`);
-  const contentType = response.headers.get('content-type') || '';
-  if (/text\/html|application\/json/i.test(contentType)) throw new Error('Вместо MP3 сервис вернул страницу');
-  const size = Number(response.headers.get('content-length') || track.size || 0);
+  return uploadMp3Response(env, chatId, response, track.title, track.size);
+}
+
+async function uploadMp3Response(env, chatId, response, title = 'YouTube Audio', knownSize = 0) {
+  const mime = (response.headers.get('content-type') || '').toLowerCase();
+  if (/text\/html|application\/json/i.test(mime)) throw new Error(`Сервис вернул HTML/JSON вместо MP3 (${mime})`);
+  const size = Number(response.headers.get('content-length') || knownSize || 0);
   if (size > MAX_MP3_BYTES) throw new Error('Аудио больше 50 МБ');
+  const reader = response.body.getReader();
+  const first = await reader.read();
+  if (first.done || !first.value?.length) throw new Error('Сервис вернул пустой файл');
+  const b = first.value;
+  const looksLikeMp3 = (b.length >= 3 && b[0] === 73 && b[1] === 68 && b[2] === 51) ||
+    (b.length >= 2 && b[0] === 255 && (b[1] & 0xe0) === 0xe0);
+  if (!looksLikeMp3) {
+    await reader.cancel().catch(() => {});
+    throw new Error(`Сервис вернул не MP3 (тип ${mime || 'не указан'})`);
+  }
 
   const boundary = 'CFMP3_' + crypto.randomUUID().replace(/-/g, '');
   const enc = new TextEncoder();
   const heading = enc.encode(
     `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n` +
-    `--${boundary}\r\nContent-Disposition: form-data; name="title"\r\n\r\n${track.title}\r\n` +
+    `--${boundary}\r\nContent-Disposition: form-data; name="title"\r\n\r\n${title}\r\n` +
     `--${boundary}\r\nContent-Disposition: form-data; name="audio"; filename="audio.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n`
   );
   const tail = enc.encode(`\r\n--${boundary}--\r\n`);
-  const reader = response.body.getReader();
   let state = 0, bytes = 0;
+  let firstPending = b;
   const stream = new ReadableStream({
     async pull(controller) {
       if (state === 0) {
@@ -129,7 +145,8 @@ async function uploadMp3Stream(env, chatId, track) {
         return;
       }
       if (state === 1) {
-        const {done, value} = await reader.read();
+        const {done, value} = firstPending ? {done: false, value: firstPending} : await reader.read();
+        firstPending = null;
         if (done) {
           state = 2;
           controller.enqueue(tail);
@@ -153,11 +170,47 @@ async function uploadMp3Stream(env, chatId, track) {
     headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
     body: stream,
     duplex: 'half',
-    signal: AbortSignal.timeout(18000),
+    signal: AbortSignal.timeout(16000),
   });
   const result = await uploaded.json().catch(() => ({}));
   if (!uploaded.ok || !result.ok) throw new Error(`Ошибка загрузки MP3: ${result.description || uploaded.status}`);
   return result.result;
+}
+
+// Free public conversion gateway, separate from YTMP3.GE.
+// It advertises two modes: action=download (raw MP3) and action=link (signed URL).
+// We use raw download to avoid HTML landing-page URLs like the first provider returned.
+function extractMp3Link(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const nested = [payload, payload.data, payload.result, payload.audio, payload.download];
+  for (const item of nested) {
+    if (!item || typeof item !== 'object') continue;
+    for (const key of ['downloadUrl', 'download_url', 'mp3Url', 'audioUrl', 'url', 'link', 'mp3', 'download']) {
+      const url = safeAudioUrl(item[key]);
+      if (url) return url;
+    }
+  }
+  return null;
+}
+async function convertDirect(env, chatId, videoUrl) {
+  const id = new URL(videoUrl).searchParams.get('v');
+  const url = new URL(DIRECT_MP3_URL);
+  url.searchParams.set('action', 'download');
+  url.searchParams.set('url', id);
+  url.searchParams.set('bitrate', '192');
+  const response = await fetch(url.href, {
+    headers: { Accept: 'audio/mpeg,application/octet-stream,application/json' },
+    signal: AbortSignal.timeout(15500),
+  });
+  if (!response.ok || !response.body) throw new Error(`Резервный сервис HTTP ${response.status}`);
+  const mime = (response.headers.get('content-type') || '').toLowerCase();
+  if (mime.includes('json')) {
+    const data = await response.json().catch(() => null);
+    const mp3Url = extractMp3Link(data);
+    if (!mp3Url) throw new Error(`Резервный API не прислал ссылку на MP3: ${String(data?.message || data?.error || data?.status || 'неизвестный формат').slice(0, 100)}`);
+    return uploadMp3Stream(env, chatId, {url: mp3Url, title: 'YouTube Audio', size: 0});
+  }
+  return uploadMp3Response(env, chatId, response);
 }
 
 async function handleUpdate(env, update) {
@@ -176,12 +229,18 @@ async function handleUpdate(env, update) {
     await sendText(env, chatId, '🔗 Отправь ссылку вида https://youtu.be/VIDEO_ID или на YouTube Shorts.');
     return;
   }
-  await sendText(env, chatId, '⏳ Конвертирую в MP3… Обычно это занимает несколько секунд.');
+  await sendText(env, chatId, '⏳ Получаю MP3… Подожди немного.');
   try {
+    try {
+      await convertDirect(env, chatId, videoUrl);
+      return;
+    } catch (firstError) {
+      console.warn('Direct MP3 provider failed; trying YTMP3 fallback:', String(firstError));
+    }
     const track = await convert(videoUrl);
     await sendMp3(env, chatId, track);
   } catch (error) {
-    console.error('MP3 conversion error:', String(error));
+    console.error('MP3 conversion error (both providers attempted):', String(error));
     try {
       await sendText(env, chatId, '❌ Не получилось получить MP3. Попробуй более короткое видео или повтори позже. Внешний сервис может быть недоступен.');
     } catch (sendError) {
