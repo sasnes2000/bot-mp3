@@ -130,88 +130,53 @@ async function convertNoTube(videoUrl) {
   throw new Error('noTube не выдал прямую ссылку на MP3 (страница без кнопки скачивания)');
 }
 
+// Cloudflare's streamed multipart requests can be refused by Telegram.
+// For short audio, buffer the verified MP3 and let FormData generate the
+// multipart body (including boundary and length) automatically.
+const MAX_BUFFERED_MP3_BYTES = 20 * 1024 * 1024;
+
 async function sendMp3(env, chatId, track) {
-  // Prefer streaming bytes from noTube: Telegram often cannot fetch download URLs itself.
-  // Do not buffer the MP3 in Worker memory.
-  try {
-    return await uploadMp3Stream(env, chatId, track);
-  } catch (error) {
-    console.warn('noTube MP3 streaming failed, trying URL sendAudio:', String(error));
-    if (track.size > 20 * 1024 * 1024) throw error;
-    return telegram(env, 'sendAudio', { chat_id: chatId, audio: track.url, title: track.title }, 7000);
-  }
-}
-
-async function uploadMp3Stream(env, chatId, track) {
-  const response = await fetch(track.url, { signal: AbortSignal.timeout(9000) });
-  if (!response.ok || !response.body) throw new Error(`Не удалось получить MP3: HTTP ${response.status}`);
-  return uploadMp3Response(env, chatId, response, track.title, track.size);
-}
-
-async function uploadMp3Response(env, chatId, response, title = 'YouTube Audio', knownSize = 0) {
+  const response = await fetch(track.url, {
+    signal: AbortSignal.timeout(18000),
+    headers: { 'Accept': 'audio/mpeg,audio/*;q=0.9,*/*;q=0.1' },
+  });
+  if (!response.ok) throw new Error(`noTube MP3 HTTP ${response.status}`);
   const mime = (response.headers.get('content-type') || '').toLowerCase();
-  if (/text\/html|application\/json/i.test(mime)) throw new Error(`Сервис вернул HTML/JSON вместо MP3 (${mime})`);
-  const size = Number(response.headers.get('content-length') || knownSize || 0);
-  if (size > MAX_MP3_BYTES) throw new Error('Аудио больше 50 МБ');
-  const reader = response.body.getReader();
-  const first = await reader.read();
-  if (first.done || !first.value?.length) throw new Error('Сервис вернул пустой файл');
-  const b = first.value;
-  const looksLikeMp3 = (b.length >= 3 && b[0] === 73 && b[1] === 68 && b[2] === 51) ||
-    (b.length >= 2 && b[0] === 255 && (b[1] & 0xe0) === 0xe0);
-  if (!looksLikeMp3) {
-    await reader.cancel().catch(() => {});
-    throw new Error(`Сервис вернул не MP3 (тип ${mime || 'не указан'})`);
+  if (/text\/html|application\/json|text\/plain/.test(mime)) {
+    throw new Error(`noTube вернул не аудио: ${mime}`);
   }
+  const declaredLength = Number(response.headers.get('content-length') || 0);
+  if (declaredLength > MAX_BUFFERED_MP3_BYTES) {
+    throw new Error('Файл больше 20 МБ: безопасный лимит Cloudflare Pages');
+  }
+  const buffer = await response.arrayBuffer();
+  if (!buffer.byteLength || buffer.byteLength > MAX_BUFFERED_MP3_BYTES) {
+    throw new Error(`Недопустимый размер MP3: ${buffer.byteLength} байт`);
+  }
+  const b = new Uint8Array(buffer);
+  const isMp3 = (b.length >= 3 && b[0] === 73 && b[1] === 68 && b[2] === 51) ||
+    (b.length >= 2 && b[0] === 255 && (b[1] & 0xe0) === 0xe0);
+  if (!isMp3) throw new Error(`Ответ noTube не похож на MP3 (тип: ${mime || 'неизвестен'})`);
 
-  const boundary = 'CFMP3_' + crypto.randomUUID().replace(/-/g, '');
-  const enc = new TextEncoder();
-  const heading = enc.encode(
-    `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n` +
-    `--${boundary}\r\nContent-Disposition: form-data; name="title"\r\n\r\n${title}\r\n` +
-    `--${boundary}\r\nContent-Disposition: form-data; name="audio"; filename="audio.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n`
-  );
-  const tail = enc.encode(`\r\n--${boundary}--\r\n`);
-  let state = 0, bytes = 0;
-  let firstPending = b;
-  const stream = new ReadableStream({
-    async pull(controller) {
-      if (state === 0) {
-        state = 1;
-        controller.enqueue(heading);
-        return;
-      }
-      if (state === 1) {
-        const {done, value} = firstPending ? {done: false, value: firstPending} : await reader.read();
-        firstPending = null;
-        if (done) {
-          state = 2;
-          controller.enqueue(tail);
-        } else {
-          bytes += value.byteLength;
-          if (bytes > MAX_MP3_BYTES) {
-            await reader.cancel();
-            controller.error(new Error('MP3 превысил ограничение 50 МБ'));
-            return;
-          }
-          controller.enqueue(value);
-        }
-        return;
-      }
-      controller.close();
-    },
-    cancel() { reader.cancel().catch(() => {}); }
-  });
-  const uploaded = await fetch(`${TELEGRAM_URL}${env.TELEGRAM_BOT_TOKEN}/sendAudio`, {
+  console.log('MP3 bytes verified:', buffer.byteLength, 'mime:', mime || 'not supplied');
+  const form = new FormData();
+  form.set('chat_id', String(chatId));
+  form.set('title', String(track.title || 'YouTube MP3').slice(0, 64));
+  form.set('audio', new Blob([buffer], {type: 'audio/mpeg'}), 'audio.mp3');
+  const posted = await fetch(`${TELEGRAM_URL}${env.TELEGRAM_BOT_TOKEN}/sendAudio`, {
     method: 'POST',
-    headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
-    body: stream,
-    duplex: 'half',
-    signal: AbortSignal.timeout(16000),
+    body: form,
+    signal: AbortSignal.timeout(18000),
   });
-  const result = await uploaded.json().catch(() => ({}));
-  if (!uploaded.ok || !result.ok) throw new Error(`Ошибка загрузки MP3: ${result.description || uploaded.status}`);
-  return result.result;
+  // Avoid logging tokens, file URLs, or request headers. Telegram description is enough.
+  const body = await posted.text();
+  let data;
+  try { data = JSON.parse(body); } catch { data = {}; }
+  if (!posted.ok || !data.ok) {
+    const why = data.description || `HTTP ${posted.status}: ${body.slice(0, 180)}`;
+    throw new Error(`Telegram MP3 upload failed: ${why}`);
+  }
+  return data.result;
 }
 
 async function handleUpdate(env, update) {
@@ -237,7 +202,7 @@ async function handleUpdate(env, update) {
   } catch (error) {
     console.error('noTube MP3 conversion error:', String(error));
     try {
-      await sendText(env, chatId, '❌ Не удалось получить MP3 через noTube. Сервис может отклонять автоматические запросы. Попробуй позже.');
+      await sendText(env, chatId, '❌ MP3 не отправился. Подробная причина записана в Cloudflare Logs.');
     } catch (sendError) {
       console.error('Could not send error message:', String(sendError));
     }
