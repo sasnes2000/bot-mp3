@@ -1,14 +1,13 @@
 // Telegram YouTube -> MP3 bot for Cloudflare Pages (drag-and-drop ZIP).
 // Conversion is performed by third-party services, not Cloudflare.
-// V2: prefer direct MP3 bytes, fall back to old provider, never send HTML as audio.
-const CONVERTER_URL = 'https://ytmp3.ge/api/convert';
-const DIRECT_MP3_URL = 'https://api.omegatech.app/api/download/ytmp3';
+// noTube trial: undocumented web form endpoints; not guaranteed to work.
+const NOTUBE_HOST = 'https://s47.notube.net'; // Seen in an unofficial public client; may change.
 const MAX_MP3_BYTES = 50 * 1024 * 1024;
 const TELEGRAM_URL = 'https://api.telegram.org/bot';
 const HELP_TEXT =
   '🎧 Привет! Пришли ссылку на YouTube или YouTube Shorts, и я попробую отправить MP3.\n\n' +
   '✅ Обычные видео и Shorts\n' +
-  '⚠️ Длинные видео могут не обработаться из-за ограничений Cloudflare и внешнего конвертера.\n' +
+  '⚠️ noTube использует неофициальные внутренние запросы; доступность не гарантируется.\n' +
   'Скачивай только контент, на который у тебя есть права.';
 
 function getIdFromMessage(messageText) {
@@ -57,52 +56,90 @@ async function sendText(env, chatId, text) {
   return telegram(env, 'sendMessage', { chat_id: chatId, text });
 }
 
-function safeAudioUrl(value) {
-  if (typeof value !== 'string') return null;
+function safeAudioUrl(value, baseUrl = 'https://notube.net/') {
+  if (typeof value !== 'string' || !value.trim()) return null;
   try {
-    const url = new URL(value);
-    if (url.protocol !== 'https:' || url.username || url.password) return null;
-    const host = url.hostname.toLowerCase();
-    if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') ||
-        /^(?:10|127|0|192\.168|169\.254)\./.test(host) || host === '[::1]') return null;
-    return url.href;
+    const u = new URL(value.replace(/&amp;/g, '&'), baseUrl);
+    if (u.protocol !== 'https:' || u.username || u.password) return null;
+    const host = u.hostname.toLowerCase();
+    if (!host || host === 'localhost' || host.endsWith('.local') ||
+      /^(?:10|127|0|192\.168|169\.254)\./.test(host) || host === '[::1]') return null;
+    return u.href;
   } catch { return null; }
 }
 
-async function convert(videoUrl) {
-  const response = await fetch(CONVERTER_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-    body: new URLSearchParams({ youtube_url: videoUrl, quality: '192' }).toString(),
-    signal: AbortSignal.timeout(20500),
+const ntHeaders = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+  'Accept': 'application/json, text/javascript, */*; q=0.01',
+  'Origin': 'https://notube.net',
+  'Referer': 'https://notube.net/ru/youtube-app-441',
+};
+async function ntPost(path, fields, timeout = 7000, requireJson = true) {
+  const response = await fetch(`${NOTUBE_HOST}${path}`, {
+    method: 'POST', headers: ntHeaders,
+    body: new URLSearchParams(fields).toString(),
+    signal: AbortSignal.timeout(timeout),
   });
-  if (!response.ok) throw new Error(`Конвертер вернул HTTP ${response.status}`);
-  const content = await response.json().catch(() => null);
-  if (!content || content.success !== true) {
-    throw new Error(`Не удалось конвертировать: ${String(content?.error || 'ошибка API').slice(0, 150)}`);
+  if (!response.ok) throw new Error(`noTube ${path}: HTTP ${response.status}`);
+  const raw = await response.text();
+  try { return JSON.parse(raw); }
+  catch { if (!requireJson) return { raw }; throw new Error(`noTube ${path}: неверный ответ ${response.headers.get('content-type') || 'без типа'}`); }
+}
+function extractDownloadLink(html, baseUrl) {
+  const decoded = String(html || '').replace(/\\\//g, '/').replace(/&amp;/g, '&');
+  const anchors = decoded.match(/<a\b[^>]*>/gi) || [];
+  for (const a of anchors) {
+    if (/\bid=["']downloadButton["']/i.test(a)) {
+      const m = a.match(/\bhref=["']([^"']+)["']/i);
+      if (m) return safeAudioUrl(m[1], baseUrl);
+    }
   }
-  const url = safeAudioUrl(content.downloadUrl);
-  if (!url) throw new Error('Конвертер не прислал безопасную ссылку на MP3');
-  const size = Number(content.size || 0);
-  if (size && size > MAX_MP3_BYTES) throw new Error('MP3 больше 50 МБ — Telegram его не примет');
-  return { url, title: String(content.title || 'YouTube Audio').slice(0, 90), size };
+  // Other versions use a direct download.php link without a button ID.
+  const m = decoded.match(/(?:href|location\.href)\s*[=:]\s*["']([^"']*download\.php\?[^"']+)["']/i);
+  if (m) return safeAudioUrl(m[1], baseUrl);
+  return null;
+}
+async function convertNoTube(videoUrl) {
+  const weight = await ntPost('/recover_weight.php', {
+    url: videoUrl, format: 'mp3', lang: 'en', subscribed: 'false',
+  });
+  if (!weight || typeof weight !== 'object' || !weight.token || !weight.name_mp4) {
+    console.warn('noTube recover_weight invalid metadata:', typeof weight, Object.keys(weight || {}).join(','));
+    throw new Error('noTube не выдал token/name_mp4 для конвертации');
+  }
+  const token = String(weight.token);
+  const initialization = await ntPost('/recover_file.php?lang=en', {
+    url: videoUrl, format: 'mp3', lang: 'en', name_mp4: String(weight.name_mp4),
+    token, subscribed: 'false', playlist: 'false', adblock: 'false',
+  }, 10000, false);
+  if (initialization?.error || initialization?.success === false) {
+    throw new Error(`noTube отказал в конвертации: ${String(initialization.error || initialization.message || '').slice(0, 120)}`);
+  }
+  const pageUrl = `https://notube.net/en/download?token=${encodeURIComponent(token)}`;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const page = await fetch(pageUrl, {
+      headers: { 'User-Agent': ntHeaders['User-Agent'], 'Referer': 'https://notube.net/' },
+      signal: AbortSignal.timeout(4500),
+    });
+    if (!page.ok) throw new Error(`noTube download page HTTP ${page.status}`);
+    const link = extractDownloadLink(await page.text(), page.url || pageUrl);
+    if (link) return { url: link, title: 'YouTube MP3', size: 0 };
+    if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 1200));
+  }
+  throw new Error('noTube не выдал прямую ссылку на MP3 (страница без кнопки скачивания)');
 }
 
 async function sendMp3(env, chatId, track) {
-  // Telegram fetches MP3 by URL itself. Up to 20MB by URL; server upload up to 50MB.
-  // This does not use Cloudflare RAM to store the audio file.
-  if (!track.size || track.size <= 20 * 1024 * 1024) {
-    try {
-      return await telegram(env, 'sendAudio', {
-        chat_id: chatId,
-        audio: track.url,
-        title: track.title,
-      }, 9500);
-    } catch (error) {
-      console.warn('URL-based sendAudio failed; trying a streamed upload:', String(error));
-    }
+  // Prefer streaming bytes from noTube: Telegram often cannot fetch download URLs itself.
+  // Do not buffer the MP3 in Worker memory.
+  try {
+    return await uploadMp3Stream(env, chatId, track);
+  } catch (error) {
+    console.warn('noTube MP3 streaming failed, trying URL sendAudio:', String(error));
+    if (track.size > 20 * 1024 * 1024) throw error;
+    return telegram(env, 'sendAudio', { chat_id: chatId, audio: track.url, title: track.title }, 7000);
   }
-  return uploadMp3Stream(env, chatId, track);
 }
 
 async function uploadMp3Stream(env, chatId, track) {
@@ -177,42 +214,6 @@ async function uploadMp3Response(env, chatId, response, title = 'YouTube Audio',
   return result.result;
 }
 
-// Free public conversion gateway, separate from YTMP3.GE.
-// It advertises two modes: action=download (raw MP3) and action=link (signed URL).
-// We use raw download to avoid HTML landing-page URLs like the first provider returned.
-function extractMp3Link(payload) {
-  if (!payload || typeof payload !== 'object') return null;
-  const nested = [payload, payload.data, payload.result, payload.audio, payload.download];
-  for (const item of nested) {
-    if (!item || typeof item !== 'object') continue;
-    for (const key of ['downloadUrl', 'download_url', 'mp3Url', 'audioUrl', 'url', 'link', 'mp3', 'download']) {
-      const url = safeAudioUrl(item[key]);
-      if (url) return url;
-    }
-  }
-  return null;
-}
-async function convertDirect(env, chatId, videoUrl) {
-  const id = new URL(videoUrl).searchParams.get('v');
-  const url = new URL(DIRECT_MP3_URL);
-  url.searchParams.set('action', 'download');
-  url.searchParams.set('url', id);
-  url.searchParams.set('bitrate', '192');
-  const response = await fetch(url.href, {
-    headers: { Accept: 'audio/mpeg,application/octet-stream,application/json' },
-    signal: AbortSignal.timeout(15500),
-  });
-  if (!response.ok || !response.body) throw new Error(`Резервный сервис HTTP ${response.status}`);
-  const mime = (response.headers.get('content-type') || '').toLowerCase();
-  if (mime.includes('json')) {
-    const data = await response.json().catch(() => null);
-    const mp3Url = extractMp3Link(data);
-    if (!mp3Url) throw new Error(`Резервный API не прислал ссылку на MP3: ${String(data?.message || data?.error || data?.status || 'неизвестный формат').slice(0, 100)}`);
-    return uploadMp3Stream(env, chatId, {url: mp3Url, title: 'YouTube Audio', size: 0});
-  }
-  return uploadMp3Response(env, chatId, response);
-}
-
 async function handleUpdate(env, update) {
   const msg = update?.message;
   if (!msg || !msg.chat?.id) return;
@@ -231,18 +232,12 @@ async function handleUpdate(env, update) {
   }
   await sendText(env, chatId, '⏳ Получаю MP3… Подожди немного.');
   try {
-    try {
-      await convertDirect(env, chatId, videoUrl);
-      return;
-    } catch (firstError) {
-      console.warn('Direct MP3 provider failed; trying YTMP3 fallback:', String(firstError));
-    }
-    const track = await convert(videoUrl);
+    const track = await convertNoTube(videoUrl);
     await sendMp3(env, chatId, track);
   } catch (error) {
-    console.error('MP3 conversion error (both providers attempted):', String(error));
+    console.error('noTube MP3 conversion error:', String(error));
     try {
-      await sendText(env, chatId, '❌ Не получилось получить MP3. Попробуй более короткое видео или повтори позже. Внешний сервис может быть недоступен.');
+      await sendText(env, chatId, '❌ Не удалось получить MP3 через noTube. Сервис может отклонять автоматические запросы. Попробуй позже.');
     } catch (sendError) {
       console.error('Could not send error message:', String(sendError));
     }
