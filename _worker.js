@@ -50,6 +50,8 @@ const MESSAGES = {
     saved: '✅ Выбран русский язык.',
     help: '🎧 Привет! Пришли ссылку на YouTube или YouTube Shorts, и я попробую отправить MP3.\n\n' +
       '✅ Обычные видео и Shorts\n' +
+      '⚠️ Конвертация через noTube может быть недоступна.\n' +
+      'Скачивай только контент, на который у тебя есть права.\n\n' +
       '🌍 Сменить язык: /language',
     badLink: '🔗 Отправь ссылку вида https://youtu.be/VIDEO_ID или на YouTube Shorts.',
     progress: '⏳ Получаю MP3… Подожди немного.',
@@ -60,6 +62,8 @@ const MESSAGES = {
     saved: '✅ English selected.',
     help: '🎧 Hi! Send me a YouTube or YouTube Shorts link, and I’ll try to send you an MP3.\n\n' +
       '✅ Regular videos and Shorts\n' +
+      '⚠️ Conversion via noTube may be unavailable.\n' +
+      'Only download content you have the rights to use.\n\n' +
       '🌍 Change language: /language',
     badLink: '🔗 Send a link like https://youtu.be/VIDEO_ID or a YouTube Shorts link.',
     progress: '⏳ Getting your MP3… Please wait.',
@@ -226,17 +230,14 @@ async function convertNoTube(videoUrl) {
   throw new Error('noTube не выдал прямую ссылку на MP3 (страница без кнопки скачивания)');
 }
 
-// Telegram Bot API sendAudio supports files up to 50 MiB.
-// FormData uploads are buffered; large files may still exceed Cloudflare's
-// 128 MiB Worker memory or the request's timeout, especially concurrently.
-// This sets the bot's maximum allowed MP3 size, not a guarantee of delivery.
-// Both MP3 fetch and Telegram upload now allow up to 30 seconds each.
-// CAUTION: ctx.waitUntil has a roughly 30-second overall post-response execution window
-// on Cloudflare Pages, including noTube conversion, so these are not additive guarantees.
+// Cloudflare's streamed multipart requests can be refused by Telegram.
+// For short audio, buffer the verified MP3 and let FormData generate the
+// multipart body (including boundary and length) automatically.
+const MAX_BUFFERED_MP3_BYTES = 20 * 1024 * 1024;
 
 async function sendMp3(env, chatId, track) {
   const response = await fetch(track.url, {
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(18000),
     headers: { 'Accept': 'audio/mpeg,audio/*;q=0.9,*/*;q=0.1' },
   });
   if (!response.ok) throw new Error(`noTube MP3 HTTP ${response.status}`);
@@ -245,11 +246,11 @@ async function sendMp3(env, chatId, track) {
     throw new Error(`noTube вернул не аудио: ${mime}`);
   }
   const declaredLength = Number(response.headers.get('content-length') || 0);
-  if (declaredLength > MAX_MP3_BYTES) {
-    throw new Error('Файл больше 50 МБ: лимит Telegram Bot API');
+  if (declaredLength > MAX_BUFFERED_MP3_BYTES) {
+    throw new Error('Файл больше 20 МБ: безопасный лимит Cloudflare Pages');
   }
   const buffer = await response.arrayBuffer();
-  if (!buffer.byteLength || buffer.byteLength > MAX_MP3_BYTES) {
+  if (!buffer.byteLength || buffer.byteLength > MAX_BUFFERED_MP3_BYTES) {
     throw new Error(`Недопустимый размер MP3: ${buffer.byteLength} байт`);
   }
   const b = new Uint8Array(buffer);
@@ -265,7 +266,7 @@ async function sendMp3(env, chatId, track) {
   const posted = await fetch(`${TELEGRAM_URL}${env.TELEGRAM_BOT_TOKEN}/sendAudio`, {
     method: 'POST',
     body: form,
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(18000),
   });
   // Avoid logging tokens, file URLs, or request headers. Telegram description is enough.
   const body = await posted.text();
