@@ -234,10 +234,13 @@ async function convertNoTube(videoUrl) {
 // FormData uploads are buffered; large files may still exceed Cloudflare's
 // 128 MiB Worker memory or the request's timeout, especially concurrently.
 // This sets the bot's maximum allowed MP3 size, not a guarantee of delivery.
+// Both MP3 fetch and Telegram upload now allow up to 30 seconds each.
+// CAUTION: ctx.waitUntil has a roughly 30-second overall post-response execution window
+// on Cloudflare Pages, including noTube conversion, so these are not additive guarantees.
 
 async function sendMp3(env, chatId, track) {
   const response = await fetch(track.url, {
-    signal: AbortSignal.timeout(18000),
+    signal: AbortSignal.timeout(30000),
     headers: { 'Accept': 'audio/mpeg,audio/*;q=0.9,*/*;q=0.1' },
   });
   if (!response.ok) throw new Error(`noTube MP3 HTTP ${response.status}`);
@@ -266,7 +269,7 @@ async function sendMp3(env, chatId, track) {
   const posted = await fetch(`${TELEGRAM_URL}${env.TELEGRAM_BOT_TOKEN}/sendAudio`, {
     method: 'POST',
     body: form,
-    signal: AbortSignal.timeout(18000),
+    signal: AbortSignal.timeout(30000),
   });
   // Avoid logging tokens, file URLs, or request headers. Telegram description is enough.
   const body = await posted.text();
