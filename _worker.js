@@ -50,6 +50,8 @@ const MESSAGES = {
     saved: '✅ Выбран русский язык.',
     help: '🎧 Привет! Пришли ссылку на YouTube или YouTube Shorts, и я попробую отправить MP3.\n\n' +
       '✅ Обычные видео и Shorts\n' +
+      '⚠️ Конвертация через noTube может быть недоступна.\n' +
+      'Скачивай только контент, на который у тебя есть права.\n\n' +
       '🌍 Сменить язык: /language',
     badLink: '🔗 Отправь ссылку вида https://youtu.be/VIDEO_ID или на YouTube Shorts.',
     progress: '⏳ Получаю MP3… Подожди немного.',
@@ -60,6 +62,8 @@ const MESSAGES = {
     saved: '✅ English selected.',
     help: '🎧 Hi! Send me a YouTube or YouTube Shorts link, and I’ll try to send you an MP3.\n\n' +
       '✅ Regular videos and Shorts\n' +
+      '⚠️ Conversion via noTube may be unavailable.\n' +
+      'Only download content you have the rights to use.\n\n' +
       '🌍 Change language: /language',
     badLink: '🔗 Send a link like https://youtu.be/VIDEO_ID or a YouTube Shorts link.',
     progress: '⏳ Getting your MP3… Please wait.',
@@ -226,10 +230,10 @@ async function convertNoTube(videoUrl) {
   throw new Error('noTube не выдал прямую ссылку на MP3 (страница без кнопки скачивания)');
 }
 
-// Cloudflare's streamed multipart requests can be refused by Telegram.
-// For short audio, buffer the verified MP3 and let FormData generate the
-// multipart body (including boundary and length) automatically.
-const MAX_BUFFERED_MP3_BYTES = 20 * 1024 * 1024;
+// Telegram Bot API sendAudio supports files up to 50 MiB.
+// FormData uploads are buffered; large files may still exceed Cloudflare's
+// 128 MiB Worker memory or the request's timeout, especially concurrently.
+// This sets the bot's maximum allowed MP3 size, not a guarantee of delivery.
 
 async function sendMp3(env, chatId, track) {
   const response = await fetch(track.url, {
@@ -242,11 +246,11 @@ async function sendMp3(env, chatId, track) {
     throw new Error(`noTube вернул не аудио: ${mime}`);
   }
   const declaredLength = Number(response.headers.get('content-length') || 0);
-  if (declaredLength > MAX_BUFFERED_MP3_BYTES) {
-    throw new Error('Файл больше 20 МБ: безопасный лимит Cloudflare Pages');
+  if (declaredLength > MAX_MP3_BYTES) {
+    throw new Error('Файл больше 50 МБ: лимит Telegram Bot API');
   }
   const buffer = await response.arrayBuffer();
-  if (!buffer.byteLength || buffer.byteLength > MAX_BUFFERED_MP3_BYTES) {
+  if (!buffer.byteLength || buffer.byteLength > MAX_MP3_BYTES) {
     throw new Error(`Недопустимый размер MP3: ${buffer.byteLength} байт`);
   }
   const b = new Uint8Array(buffer);
